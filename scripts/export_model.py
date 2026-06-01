@@ -1,28 +1,38 @@
 #!/usr/bin/env python
 """
-export_model.py — export the trained timm MobileNetV4 binary NSFW model (from
-train_nsfw.py) to ONNX + INT8, VERIFIED against PyTorch, for onnxruntime-web.
+export_model.py — export a trained timm binary NSFW model (from train_nsfw.py or
+the per-variant train_nsfw_hf_<variant>.py trainers) to ONNX + INT8, VERIFIED
+against PyTorch, for onnxruntime-web.
+
+Backbone-agnostic by design: the checkpoint carries its own backbone name +
+labels + preprocessing, so the SAME script exports any of the supported
+backbones — mnv4 / mnv3 / tinynet / lcnet. It re-emits labels.json /
+preprocess.json too.
 
 A LogitsOnly wrapper, an export-strategy sweep that keeps the FIRST config
 matching PyTorch within 1e-3, and STATIC INT8 quantization with calibration.
-No AvgPool patch is needed — timm MobileNetV4/V3 heads pool cleanly to ONNX
-GlobalAveragePool (unlike HF EfficientNet's oversized fixed-kernel pooler).
+No AvgPool patch is needed — timm MobileNetV4/V3, TinyNet and LCNet heads pool
+cleanly to ONNX GlobalAveragePool (unlike HF EfficientNet's oversized fixed-
+kernel pooler).
 
 Quantization scheme: per-channel INT8 weights + UInt8 activations (QDQ). This is
 the ORT static-quant default that runs everywhere on the WASM backend and on
 WebGPU via per-op CPU fallback for any unsupported QDQ op.
 
-The checkpoint carries its own backbone name + labels + preprocessing, so this
-script is self-describing; it re-emits labels.json / preprocess.json too.
-
 INSTALL:
     pip install "timm>=1.0.0" torch onnx onnxruntime pillow numpy
 
 RUN:
-    python scripts/export_model.py                      # uses model/nsfw_mnv4.pt
-    python scripts/export_model.py --calib-data data/   # sample calib imgs from dataset
+    # Multi-variant layout. --variant derives the checkpoint AND the out-dir:
+    #   --variant <v>  ->  --checkpoint model/<v>/nsfw_<v>.pt   --out-dir model/<v>
+    python scripts/export_model.py --variant mnv4 --calib-data data/
+    python scripts/export_model.py --variant mnv3 --calib-data data/
+    # An explicit --checkpoint or --out-dir always overrides the derived path.
+
+    # Legacy single-model layout (model/nsfw_mnv4.pt -> model/); omit --variant:
+    python scripts/export_model.py --calib-data data/
 Then:
-    npm run embed-model && npm run build
+    npm run embed:<variant> && npm run build      # or: npm run embed-model && npm run build
 """
 import argparse
 import glob
@@ -37,11 +47,25 @@ import timm
 import onnxruntime as ort
 from PIL import Image
 
+# The package's four shipped variants. --variant only uses this to derive the
+# default checkpoint/out-dir paths; the actual architecture is always read from
+# the checkpoint, so adding a backbone elsewhere doesn't require touching this.
+VARIANTS = ("mnv4", "mnv3", "tinynet", "lcnet")
+
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", default="model/nsfw_mnv4.pt")
-    p.add_argument("--out-dir", default="model")
+    p.add_argument("--variant", default=None, choices=list(VARIANTS),
+                   help="convenience for the multi-variant layout: derive "
+                        "--checkpoint model/<v>/nsfw_<v>.pt and --out-dir model/<v>. "
+                        "Explicit --checkpoint/--out-dir override it. Omit for the "
+                        "legacy single-model layout (model/nsfw_mnv4.pt -> model/).")
+    p.add_argument("--checkpoint", default=None,
+                   help="trained .pt to export (default: model/<variant>/nsfw_<variant>.pt "
+                        "when --variant is given, else model/nsfw_mnv4.pt)")
+    p.add_argument("--out-dir", default=None,
+                   help="output dir for nsfw.onnx / nsfw.int8.onnx / labels.json / "
+                        "preprocess.json (default: model/<variant> with --variant, else model)")
     p.add_argument("--calib-data", default=None,
                    help="dir of images (ImageFolder ok) to sample INT8 calibration from")
     p.add_argument("--calib-count", type=int, default=400)
@@ -56,9 +80,22 @@ def softmax(z):
 
 def main():
     args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    # Resolve checkpoint / out-dir. --variant is purely a convenience that derives
+    # both for the multi-variant layout (model/<v>/nsfw_<v>.pt -> model/<v>); an
+    # explicit --checkpoint or --out-dir always wins. Without --variant we keep the
+    # original single-model defaults so legacy train_nsfw.py output exports unchanged.
+    if args.variant:
+        checkpoint = args.checkpoint or os.path.join("model", args.variant, f"nsfw_{args.variant}.pt")
+        out_dir = args.out_dir or os.path.join("model", args.variant)
+        print(f"[export] variant={args.variant}  checkpoint={checkpoint}  out-dir={out_dir}")
+    else:
+        checkpoint = args.checkpoint or os.path.join("model", "nsfw_mnv4.pt")
+        out_dir = args.out_dir or "model"
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     backbone = ckpt["backbone"]
     labels = ckpt["labels"]
     size = int(ckpt["size"])
@@ -118,8 +155,8 @@ def main():
         ("dynamo, native opset     ", lambda p: exp_dynamo(p)),
     ]
 
-    fp32_path = os.path.join(args.out_dir, "nsfw.onnx")
-    tmp = os.path.join(args.out_dir, "_try.onnx")
+    fp32_path = os.path.join(out_dir, "nsfw.onnx")
+    tmp = os.path.join(out_dir, "_try.onnx")
     chosen = None
     print("\n[export] searching for a faithful export configuration:")
     for name, fn in strategies:
@@ -144,14 +181,14 @@ def main():
     print(f"[export] FP32 export OK via: {chosen}")
 
     # Re-emit labels + preprocess so the package is reproducible from the checkpoint.
-    with open(os.path.join(args.out_dir, "labels.json"), "w") as f:
+    with open(os.path.join(out_dir, "labels.json"), "w") as f:
         json.dump(labels, f)
     preprocess = {
         "size": size, "cropSize": None, "doCenterCrop": False,
         "rescaleFactor": 1.0 / 255.0, "rescaleOffset": False,
         "doNormalize": True, "mean": mean, "std": std, "includeTop": False,
     }
-    with open(os.path.join(args.out_dir, "preprocess.json"), "w") as f:
+    with open(os.path.join(out_dir, "preprocess.json"), "w") as f:
         json.dump(preprocess, f, indent=2)
 
     # ── INT8 static quantization (correct for CNNs) ──────────────────────
@@ -160,7 +197,7 @@ def main():
     )
 
     src = fp32_path
-    prepped = os.path.join(args.out_dir, "nsfw.prep.onnx")
+    prepped = os.path.join(out_dir, "nsfw.prep.onnx")
     try:
         from onnxruntime.quantization import quant_pre_process
         quant_pre_process(fp32_path, prepped)
@@ -186,7 +223,7 @@ def main():
         _r.Random(0).shuffle(calib_files)
         calib_files = calib_files[: args.calib_count]
 
-    int8_path = os.path.join(args.out_dir, "nsfw.int8.onnx")
+    int8_path = os.path.join(out_dir, "nsfw.int8.onnx")
 
     if calib_files:
         print(f"\n[export] static-quantizing INT8 with {len(calib_files)} calibration images")
@@ -241,7 +278,10 @@ def main():
 
     mb = os.path.getsize(int8_path) / (1024 * 1024)
     print(f"\n[export] done. embedded model will be {mb:.2f} MB")
-    print("[export] next:  npm run embed-model && npm run build")
+    if args.variant:
+        print(f"[export] next:  npm run embed:{args.variant} && npm run build")
+    else:
+        print("[export] next:  npm run embed-model && npm run build")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+# The export pipeline writes here:
+#   nsfw_mnv4.pt  nsfw.onnx  nsfw.int8.onnx  labels.json  preprocess.json
+# These are gitignored; this file just keeps the directory in the tree.

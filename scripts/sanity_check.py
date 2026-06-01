@@ -28,7 +28,9 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-OUT_DIR = "model"
+# Default model dir; override per-variant for debugging, e.g.
+#   NSFW_MODEL_DIR=model/lcnet python scripts/sanity_check.py a.jpg b.jpg
+OUT_DIR = os.environ.get("NSFW_MODEL_DIR", "model")
 
 imgs = sys.argv[1:]
 if not imgs:
