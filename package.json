@@ -1,0 +1,61 @@
+{
+  "name": "@pixagram/nsfw-lite",
+  "version": "0.1.0",
+  "description": "Fast on-device binary (sfw/nsfw) image classification for the browser. MobileNetV4-small-050 (~2.2M params, 0.1 GMACs) via onnxruntime-web, INT8-quantized. Off-main-thread Web Worker with an automatic main-thread fallback. Model bundled in the package.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "url": "https://github.com/pixagram-blockchain/nsfw-lite.git",
+    "type": "git"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "import": "./dist/worker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "embed-model": "node scripts/embed-assets.mjs",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "onnxruntime-web": ">=1.19.0"
+  },
+  "devDependencies": {
+    "onnxruntime-web": "^1.23.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  },
+  "keywords": [
+    "nsfw",
+    "sfw",
+    "content-moderation",
+    "onnx",
+    "onnxruntime-web",
+    "mobilenetv4",
+    "image-classification",
+    "web-worker",
+    "browser",
+    "client-side"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
