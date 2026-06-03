@@ -36,6 +36,13 @@ export interface PreprocessConfig {
   std: [number, number, number];
   /** EfficientNet image-classification quirk: divide by std a SECOND time. Off here. */
   includeTop?: boolean;
+  /**
+   * Canvas resize filter, read from preprocess.json: "nearest" = pixelated
+   * (smoothing off, crisp pixel blocks — the pixel-art choice), "bilinear" =
+   * smooth (the default when absent). Set to match the filter the model was
+   * trained/calibrated with so train/serve preprocessing stays in parity.
+   */
+  interpolation?: "nearest" | "bilinear";
 }
 
 /** Class label -> probability (labels are lowercased). Here: { sfw, nsfw }. */

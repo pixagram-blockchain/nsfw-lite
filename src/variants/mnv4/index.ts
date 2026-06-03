@@ -4,7 +4,7 @@
  * Fast on-device binary (sfw / nsfw) image classification for the browser,
  * powered by a MobileNetV4-conv-small-050 backbone via onnxruntime-web. Runs off-thread in a
  * Web Worker (the sibling dist/mnv4/worker.js) with an automatic main-thread
- * fallback; this variant's INT8 model is base64-embedded into this bundle.
+ * fallback; this build's uint8-quantized model is base64-embedded into this bundle.
  */
 import { makeNsfwApi } from "../../api.js";
 import type { NsfwDetectorInstance } from "../../api.js";

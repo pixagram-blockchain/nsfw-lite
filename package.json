@@ -1,7 +1,7 @@
 {
   "name": "@pixagram/nsfw-lite",
-  "version": "0.2.0",
-  "description": "Fast on-device binary (sfw/nsfw) image classification for the browser. Four interchangeable timm backbones (MobileNetV4-small-050, MobileNetV3-small-050, TinyNet-E, PP-LCNet-050) via onnxruntime-web, INT8-quantized. Off-main-thread Web Worker with an automatic main-thread fallback. Each variant ships a self-contained bundle with its model embedded; import the one you trained from @pixagram/nsfw-lite/<variant>.",
+  "version": "0.5.1",
+  "description": "Fast on-device binary (sfw/nsfw) image classification for the browser. A MobileNetV4-conv-small-050 backbone via onnxruntime-web, uint8-quantized, tuned for pixel art at 160px. Off-main-thread Web Worker with an automatic main-thread fallback; the model is base64-embedded in a single self-contained bundle.",
   "type": "module",
   "license": "Apache-2.0",
   "sideEffects": false,
@@ -27,33 +27,6 @@
       "types": "./dist/mnv4/worker.d.ts",
       "import": "./dist/mnv4/worker.js"
     },
-    "./mnv3": {
-      "types": "./dist/mnv3/index.d.ts",
-      "import": "./dist/mnv3/index.js",
-      "require": "./dist/mnv3/index.cjs"
-    },
-    "./mnv3/worker": {
-      "types": "./dist/mnv3/worker.d.ts",
-      "import": "./dist/mnv3/worker.js"
-    },
-    "./tinynet": {
-      "types": "./dist/tinynet/index.d.ts",
-      "import": "./dist/tinynet/index.js",
-      "require": "./dist/tinynet/index.cjs"
-    },
-    "./tinynet/worker": {
-      "types": "./dist/tinynet/worker.d.ts",
-      "import": "./dist/tinynet/worker.js"
-    },
-    "./lcnet": {
-      "types": "./dist/lcnet/index.d.ts",
-      "import": "./dist/lcnet/index.js",
-      "require": "./dist/lcnet/index.cjs"
-    },
-    "./lcnet/worker": {
-      "types": "./dist/lcnet/worker.d.ts",
-      "import": "./dist/lcnet/worker.js"
-    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -64,9 +37,6 @@
   "scripts": {
     "embed-model": "node scripts/embed-assets.mjs",
     "embed:mnv4": "node scripts/embed-assets.mjs mnv4",
-    "embed:mnv3": "node scripts/embed-assets.mjs mnv3",
-    "embed:tinynet": "node scripts/embed-assets.mjs tinynet",
-    "embed:lcnet": "node scripts/embed-assets.mjs lcnet",
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
@@ -83,12 +53,10 @@
     "nsfw",
     "sfw",
     "content-moderation",
+    "pixel-art",
     "onnx",
     "onnxruntime-web",
     "mobilenetv4",
-    "mobilenetv3",
-    "lcnet",
-    "tinynet",
     "image-classification",
     "web-worker",
     "browser",

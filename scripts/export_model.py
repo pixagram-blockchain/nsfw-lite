@@ -1,38 +1,59 @@
 #!/usr/bin/env python
 """
 export_model.py — export a trained timm binary NSFW model (from train_nsfw.py or
-the per-variant train_nsfw_hf_<variant>.py trainers) to ONNX + INT8, VERIFIED
-against PyTorch, for onnxruntime-web.
+the per-variant train_nsfw_hf_<variant>.py trainers) to ONNX in TWO deployment
+formats, each VERIFIED against PyTorch, for onnxruntime-web:
+
+  • nsfw.uint8.onnx — static-quantized 8-bit, for the WASM (CPU) execution
+    provider. Defaults to U8U8 (uint8 activations + uint8 weights), which is the
+    format ONNX Runtime Web's own guidance recommends for the WASM backend; pass
+    --wasm-quant u8s8 for per-channel int8 weights + reduce_range (the non-VNNI-
+    safe accuracy-leaning alternative).
+  • nsfw.fp16.onnx — float16, for the WebGPU execution provider. Converted with
+    keep_io_types=True, so the graph's inputs/outputs stay float32 — the JS side
+    keeps feeding a normal Float32Array and reading float32 logits, no float16
+    plumbing required. (float16 is intentionally NOT used for the CPU/WASM build:
+    ORT runs fp16 slowly on CPU.)
+  • nsfw.onnx — the float32 reference (self-contained), kept for verification and
+    as the source both other formats are derived from.
+
+WHY TWO ARTIFACTS: pick the format per backend at load time, e.g.
+    const ep = navigator.gpu ? 'webgpu' : 'wasm';
+    const file = ep === 'webgpu' ? 'nsfw.fp16.onnx' : 'nsfw.uint8.onnx';
+    session = await ort.InferenceSession.create(file, { executionProviders: [ep] });
+NOTE: this changes the emitted filenames (was nsfw.int8.onnx). Update your
+embed/build step to copy + reference nsfw.uint8.onnx and nsfw.fp16.onnx.
 
 Backbone-agnostic by design: the checkpoint carries its own backbone name +
-labels + preprocessing, so the SAME script exports any of the supported
-backbones — mnv4 / mnv3 / tinynet / lcnet. It re-emits labels.json /
-preprocess.json too.
+labels + preprocessing, so the SAME script exports any timm backbone it was
+trained with (e.g. mobilenetv4_conv_small_050, _035, or the full conv_small).
+It re-emits labels.json / preprocess.json too.
 
 A LogitsOnly wrapper, an export-strategy sweep that keeps the FIRST config
-matching PyTorch within 1e-3, and STATIC INT8 quantization with calibration.
-No AvgPool patch is needed — timm MobileNetV4/V3, TinyNet and LCNet heads pool
-cleanly to ONNX GlobalAveragePool (unlike HF EfficientNet's oversized fixed-
-kernel pooler).
-
-Quantization scheme: per-channel INT8 weights + UInt8 activations (QDQ). This is
-the ORT static-quant default that runs everywhere on the WASM backend and on
-WebGPU via per-op CPU fallback for any unsupported QDQ op.
+matching PyTorch within 1e-3, then static quantization with calibration. External
+weight data (torch>=2.x may split weights into a <name>.onnx.data sidecar) is
+inlined so the shipped .onnx is always self-contained.
 
 INSTALL:
-    pip install "timm>=1.0.0" torch onnx onnxruntime pillow numpy
+    pip install "timm>=1.0.0" torch onnx onnxruntime onnxconverter-common pillow numpy
 
 RUN:
     # Multi-variant layout. --variant derives the checkpoint AND the out-dir:
     #   --variant <v>  ->  --checkpoint model/<v>/nsfw_<v>.pt   --out-dir model/<v>
     python scripts/export_model.py --variant mnv4 --calib-data data/
-    python scripts/export_model.py --variant mnv3 --calib-data data/
+    python scripts/export_model.py --variant mnv4 --calib-data data/ --wasm-quant u8s8
     # An explicit --checkpoint or --out-dir always overrides the derived path.
 
     # Legacy single-model layout (model/nsfw_mnv4.pt -> model/); omit --variant:
     python scripts/export_model.py --calib-data data/
 Then:
     npm run embed:<variant> && npm run build      # or: npm run embed-model && npm run build
+
+CALIBRATION & PIXEL ART: static-quant scales are only as good as the calibration
+distribution, so --calib-data must be representative of what you serve. For a
+pixel-art classifier, point it at actual pixel art (limited palettes / hard edges
+produce different activation ranges than natural photos). The calibration resize
+mirrors the training/serve transform (square bilinear) — keep them identical.
 """
 import argparse
 import glob
@@ -41,16 +62,17 @@ import os
 import shutil
 
 import numpy as np
+import onnx
 import torch
 import torch.nn as nn
 import timm
 import onnxruntime as ort
 from PIL import Image
 
-# The package's four shipped variants. --variant only uses this to derive the
-# default checkpoint/out-dir paths; the actual architecture is always read from
-# the checkpoint, so adding a backbone elsewhere doesn't require touching this.
-VARIANTS = ("mnv4", "mnv3", "tinynet", "lcnet")
+# The package ships a single variant, mnv4. --variant only uses this to derive
+# the default checkpoint/out-dir paths; the actual architecture is always read
+# from the checkpoint, so training a different backbone needs no change here.
+VARIANTS = ("mnv4",)
 
 
 def parse_args():
@@ -64,11 +86,20 @@ def parse_args():
                    help="trained .pt to export (default: model/<variant>/nsfw_<variant>.pt "
                         "when --variant is given, else model/nsfw_mnv4.pt)")
     p.add_argument("--out-dir", default=None,
-                   help="output dir for nsfw.onnx / nsfw.int8.onnx / labels.json / "
-                        "preprocess.json (default: model/<variant> with --variant, else model)")
+                   help="output dir for nsfw.onnx / nsfw.uint8.onnx / nsfw.fp16.onnx / "
+                        "labels.json / preprocess.json (default: model/<variant> with "
+                        "--variant, else model)")
     p.add_argument("--calib-data", default=None,
-                   help="dir of images (ImageFolder ok) to sample INT8 calibration from")
+                   help="dir of images (ImageFolder ok) to sample quantization calibration from")
     p.add_argument("--calib-count", type=int, default=400)
+    p.add_argument("--wasm-quant", default="u8u8", choices=["u8u8", "u8s8"],
+                   help="8-bit scheme for the WASM artifact (default u8u8 = uint8 activations + "
+                        "uint8 weights, per-tensor; the broadly-supported WASM-friendly format "
+                        "ORT Web recommends). u8s8 = uint8 activations + per-channel int8 weights "
+                        "with reduce_range (better accuracy, non-VNNI-safe). Benchmark both — "
+                        "for a model this small, plain fp32-on-WASM is also worth comparing.")
+    p.add_argument("--skip-fp16", action="store_true",
+                   help="don't emit nsfw.fp16.onnx (e.g. if you never serve the WebGPU EP).")
     return p.parse_args()
 
 
@@ -76,6 +107,25 @@ def softmax(z):
     z = np.asarray(z).reshape(-1)
     e = np.exp(z - z.max())
     return e / e.sum()
+
+
+def _rm(path):
+    """Remove a model file and any external-data sidecar it may have produced."""
+    for f in (path, path + ".data", os.path.splitext(path)[0] + ".data"):
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def inline_save(model_or_path, dst):
+    """Save an ONNX model to `dst` fully self-contained (weights inlined). Accepts
+    a path (loaded, resolving any sidecar) or an in-memory ModelProto. torch>=2.x
+    may externalize weights into <name>.onnx.data; inlining guarantees the shipped
+    .onnx never references a missing file."""
+    m = onnx.load(model_or_path) if isinstance(model_or_path, str) else model_or_path
+    onnx.save_model(m, dst, save_as_external_data=False)
 
 
 def main():
@@ -101,8 +151,14 @@ def main():
     size = int(ckpt["size"])
     mean = [float(m) for m in ckpt["mean"]]
     std = [float(s) for s in ckpt["std"]]
+    # Resize filter the model was trained with (older checkpoints predate this and
+    # default to bilinear). Drives BOTH calibration and the preprocess.json the
+    # browser reads, so all three stages stay on the same filter.
+    interp = str(ckpt.get("interp", "bilinear"))
+    _RES = getattr(Image, "Resampling", Image)  # Pillow >=9.1 moved the enum
+    pil_resample = {"bilinear": _RES.BILINEAR, "nearest": _RES.NEAREST}.get(interp, _RES.BILINEAR)
     num_classes = len(labels)
-    print(f"[export] backbone={backbone}  classes={labels}  size={size}")
+    print(f"[export] backbone={backbone}  classes={labels}  size={size}  interp={interp}")
     if num_classes != 2:
         print(f"[export] WARNING: expected 2 classes for the binary model, got {num_classes}")
 
@@ -161,24 +217,26 @@ def main():
     print("\n[export] searching for a faithful export configuration:")
     for name, fn in strategies:
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            _rm(tmp)
             fn(tmp)
             diff = float(np.abs(pt_dummy - onnx_logits(tmp, dummy)).max())
             ok = diff < 1e-3
             print(f"  - {name:28s} max|PT-ONNX|={diff:.6f}  {'PASS' if ok else 'reject'}")
             if ok:
-                shutil.move(tmp, fp32_path)
+                # Inline as we select: torch>=2.x may have written tmp.onnx.data, so
+                # a bare move would orphan the sidecar. onnx.load resolves it; we
+                # re-save self-contained straight to the final path.
+                inline_save(tmp, fp32_path)
                 chosen = name
                 break
         except Exception as e:  # noqa: BLE001
             print(f"  - {name:28s} export error: {str(e)[:80]}")
-    if os.path.exists(tmp):
-        os.remove(tmp)
+    _rm(tmp)
     if not chosen:
         print("\n[export] FAILED: no configuration matched PyTorch. Do NOT ship.")
         raise SystemExit(2)
-    print(f"[export] FP32 export OK via: {chosen}")
+    fp32_mb = os.path.getsize(fp32_path) / (1024 * 1024)
+    print(f"[export] FP32 export OK via: {chosen}  ({fp32_mb:.2f} MB, self-contained)")
 
     # Re-emit labels + preprocess so the package is reproducible from the checkpoint.
     with open(os.path.join(out_dir, "labels.json"), "w") as f:
@@ -187,28 +245,38 @@ def main():
         "size": size, "cropSize": None, "doCenterCrop": False,
         "rescaleFactor": 1.0 / 255.0, "rescaleOffset": False,
         "doNormalize": True, "mean": mean, "std": std, "includeTop": False,
+        "interpolation": interp,
     }
     with open(os.path.join(out_dir, "preprocess.json"), "w") as f:
         json.dump(preprocess, f, indent=2)
 
-    # ── INT8 static quantization (correct for CNNs) ──────────────────────
+    # ── Shared: shape-inferred source for quantization ───────────────────
     from onnxruntime.quantization import (  # noqa: E402
         quantize_static, CalibrationDataReader, QuantType, QuantFormat,
     )
 
-    src = fp32_path
-    prepped = os.path.join(out_dir, "nsfw.prep.onnx")
-    try:
-        from onnxruntime.quantization import quant_pre_process
-        quant_pre_process(fp32_path, prepped)
-        src = prepped
-    except Exception as e:  # noqa: BLE001
-        print(f"[export] quant_pre_process unavailable ({e}); using raw FP32")
+    def prep_for_quant(src):
+        """quantize_static wants shape info. Try ORT's pre-process, then a plain
+        onnx shape-inference, then fall back to the raw graph."""
+        out = os.path.join(out_dir, "nsfw.prep.onnx")
+        try:
+            from onnxruntime.quantization import quant_pre_process
+            quant_pre_process(src, out)
+            return out
+        except Exception as e:  # noqa: BLE001
+            print(f"[export] quant_pre_process unavailable ({str(e)[:50]}); trying shape inference")
+        try:
+            inline_save(onnx.shape_inference.infer_shapes(onnx.load(src)), out)
+            return out
+        except Exception as e:  # noqa: BLE001
+            print(f"[export] shape inference failed ({str(e)[:50]}); using raw FP32")
+            return src
 
-    input_name = ort.InferenceSession(src, providers=["CPUExecutionProvider"]).get_inputs()[0].name
+    quant_src = prep_for_quant(fp32_path)
+    input_name = ort.InferenceSession(quant_src, providers=["CPUExecutionProvider"]).get_inputs()[0].name
 
     def preprocess_img(path):
-        img = Image.open(path).convert("RGB").resize((size, size), Image.BILINEAR)
+        img = Image.open(path).convert("RGB").resize((size, size), pil_resample)
         arr = np.asarray(img).astype(np.float32) / 255.0          # HWC, [0,1]
         arr = (arr - np.array(mean, np.float32)) / np.array(std, np.float32)
         arr = np.transpose(arr, (2, 0, 1))[None, ...]             # NCHW
@@ -218,15 +286,24 @@ def main():
     if args.calib_data:
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
             calib_files += glob.glob(os.path.join(args.calib_data, "**", ext), recursive=True)
-        # spread across subfolders/classes rather than taking one class first
         import random as _r
-        _r.Random(0).shuffle(calib_files)
+        _r.Random(0).shuffle(calib_files)  # spread across subfolders/classes
         calib_files = calib_files[: args.calib_count]
 
-    int8_path = os.path.join(out_dir, "nsfw.int8.onnx")
+    # ── nsfw.uint8.onnx — quantized build for the WASM (CPU) EP ───────────
+    uint8_path = os.path.join(out_dir, "nsfw.uint8.onnx")
+    if args.wasm_quant == "u8u8":
+        q_kwargs = dict(per_channel=False,
+                        weight_type=QuantType.QUInt8, activation_type=QuantType.QUInt8)
+        scheme = "U8U8 (uint8 act + uint8 weight, per-tensor)"
+    else:  # u8s8
+        q_kwargs = dict(per_channel=True, reduce_range=True,
+                        weight_type=QuantType.QInt8, activation_type=QuantType.QUInt8)
+        scheme = "U8S8 (uint8 act + per-channel int8 weight, reduce_range)"
 
     if calib_files:
-        print(f"\n[export] static-quantizing INT8 with {len(calib_files)} calibration images")
+        print(f"\n[export] static-quantizing -> nsfw.uint8.onnx  [{scheme}]  "
+              f"with {len(calib_files)} calibration images")
 
         class Calib(CalibrationDataReader):
             def __init__(self, files):
@@ -246,38 +323,66 @@ def main():
             def rewind(self):
                 self.i = 0
 
-        quantize_static(
-            src, int8_path,
-            calibration_data_reader=Calib(calib_files),
-            quant_format=QuantFormat.QDQ, per_channel=True,
-            weight_type=QuantType.QInt8, activation_type=QuantType.QUInt8,
-        )
-        # verify INT8 didn't collapse vs FP32 on a probe (binary: spread = |p0-p1|)
+        quantize_static(quant_src, uint8_path, calibration_data_reader=Calib(calib_files),
+                        quant_format=QuantFormat.QDQ, **q_kwargs)
+        # verify the quantized model didn't collapse vs FP32 on a probe
         probe = torch.from_numpy(preprocess_img(calib_files[0]))
         fp = softmax(onnx_logits(fp32_path, probe))
-        iq = softmax(onnx_logits(int8_path, probe))
+        iq = softmax(onnx_logits(uint8_path, probe))
         agree = int(np.argmax(fp)) == int(np.argmax(iq))
         spread = float(abs(iq.max() - iq.min()))
-        print(f"[verify] INT8 spread={spread:.3f}  argmax matches FP32: {agree}  "
-              f"p(fp32)={fp.round(3).tolist()}  p(int8)={iq.round(3).tolist()}")
+        print(f"[verify] uint8 spread={spread:.3f}  argmax matches FP32: {agree}  "
+              f"p(fp32)={fp.round(3).tolist()}  p(uint8)={iq.round(3).tolist()}")
         if not agree:
-            print("[verify] INT8 disagrees with FP32 on the probe; shipping FP32 as the INT8 file.")
-            shutil.copyfile(fp32_path, int8_path)
+            print("[verify] !! uint8 disagrees with FP32 on the probe — quantization likely "
+                  "collapsed (bad/unrepresentative calibration?). Shipping FP32 as the WASM "
+                  "file so you never ship a broken model; re-run with better --calib-data.")
+            inline_save(fp32_path, uint8_path)
         else:
-            print("[verify] INT8 OK")
+            print("[verify] uint8 OK")
     else:
-        print(f"\n[export] no --calib-data given — copying FP32 -> {int8_path}")
-        print("[export] (correct but larger; pass --calib-data <dir> for the small INT8 build)")
-        shutil.copyfile(fp32_path, int8_path)
+        print(f"\n[export] no --calib-data given — copying FP32 -> nsfw.uint8.onnx")
+        print("[export] (correct but larger/slower; pass --calib-data <dir> for the real 8-bit build)")
+        inline_save(fp32_path, uint8_path)
+    uint8_mb = os.path.getsize(uint8_path) / (1024 * 1024)
 
-    try:
-        if os.path.exists(prepped):
-            os.remove(prepped)
-    except OSError:
-        pass
+    # ── nsfw.fp16.onnx — float16 build for the WebGPU EP ──────────────────
+    fp16_path = os.path.join(out_dir, "nsfw.fp16.onnx")
+    fp16_mb = None
+    if not args.skip_fp16:
+        from onnxconverter_common import float16  # noqa: E402
+        # keep_io_types=True: inputs/outputs stay float32 so the JS side feeds a
+        # normal Float32Array and reads float32 logits — only the internals are
+        # fp16. The weights were inlined above, so the result is self-contained.
+        mfp16 = float16.convert_float_to_float16(onnx.load(fp32_path), keep_io_types=True)
+        onnx.save_model(mfp16, fp16_path, save_as_external_data=False)
+        # sanity check vs FP32 (CPU EP runs fp16 via casts; just confirm it's faithful)
+        d = float(np.abs(onnx_logits(fp32_path, dummy) - onnx_logits(fp16_path, dummy)).max())
+        fp_p = softmax(onnx_logits(fp32_path, dummy))
+        h_p = softmax(onnx_logits(fp16_path, dummy))
+        agree16 = int(np.argmax(fp_p)) == int(np.argmax(h_p))
+        fp16_mb = os.path.getsize(fp16_path) / (1024 * 1024)
+        print(f"\n[export] fp16 -> nsfw.fp16.onnx ({fp16_mb:.2f} MB)  "
+              f"max|fp32-fp16|={d:.4f}  argmax matches FP32: {agree16}")
+        if not agree16:
+            print("[verify] !! fp16 argmax differs from FP32 on the probe — validate accuracy "
+                  "on your val set before serving the WebGPU path (known fp16/WebGPU numerical "
+                  "discrepancies exist in some ORT builds).")
+    else:
+        print("\n[export] --skip-fp16 set; not emitting nsfw.fp16.onnx")
 
-    mb = os.path.getsize(int8_path) / (1024 * 1024)
-    print(f"\n[export] done. embedded model will be {mb:.2f} MB")
+    # cleanup the transient prep file (not the fp32 reference)
+    if quant_src != fp32_path:
+        _rm(quant_src)
+
+    # ── summary ──────────────────────────────────────────────────────────
+    print("\n[export] done. artifacts in", out_dir + ":")
+    print(f"           nsfw.onnx        {fp32_mb:5.2f} MB   float32 reference / source")
+    print(f"           nsfw.uint8.onnx  {uint8_mb:5.2f} MB   -> load on the 'wasm' (CPU) EP")
+    if fp16_mb is not None:
+        print(f"           nsfw.fp16.onnx   {fp16_mb:5.2f} MB   -> load on the 'webgpu' EP")
+    print("[export] REMINDER: emitted filenames changed (uint8 + fp16, no more nsfw.int8.onnx).")
+    print("[export]           Update your embed/build to copy + select these per execution provider.")
     if args.variant:
         print(f"[export] next:  npm run embed:{args.variant} && npm run build")
     else:

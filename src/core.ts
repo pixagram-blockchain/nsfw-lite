@@ -1,6 +1,7 @@
 /**
  * core.ts — runtime-agnostic inference helpers shared by the Web Worker and the
- * main-thread fallback. No DOM beyond OffscreenCanvas (available in both).
+ * main-thread fallback. No DOM beyond OffscreenCanvas + createImageBitmap (both
+ * available in window and worker scopes).
  */
 // The /webgpu bundle includes BOTH the WebGPU and WASM execution providers,
 // so we can prefer GPU and fall back to CPU from a single import.
@@ -149,47 +150,74 @@ function getScratch(slot: string, w: number, h: number): Scratch {
 }
 
 /**
- * Resize source pixels to the model's square input via OffscreenCanvas.
- * NOTE: canvas resampling (bilinear) is NOT identical to PIL's resampling, so
- * predictions can drift slightly vs. the Python pipeline. The training/export
- * pipeline deliberately validates with a plain resize to mirror this. If you
- * need pixel-exact parity, bake preprocessing into the ONNX graph.
+ * Resize source pixels to the model's square input.
  *
- * putImageData overwrites pixels directly (no compositing), so the source
- * canvas never needs clearing. drawImage DOES composite (source-over), so the
- * destination and crop canvases are cleared first — otherwise a transparent
- * pixel in the current image would let the previous image's colour bleed
- * through the reused canvas.
+ * The plain-resize path (this model: doCenterCrop=false) uses createImageBitmap,
+ * which scales off the main thread and can be hardware-accelerated. The resize
+ * filter follows cfg.interpolation via resizeQuality: "nearest" -> "pixelated"
+ * (crisp blocks, the pixel-art choice), otherwise "medium" (smooth). A single
+ * 1:1 readback canvas then extracts the RGBA bytes (ImageBitmap pixels can't be
+ * read without a canvas; there is no scaling on it, so smoothing is irrelevant).
+ *
+ * PARITY CAVEAT: resizeQuality is browser-dependent and not uniformly supported
+ * — notably Firefox's support for it has been incomplete, so "pixelated" may be
+ * silently ignored and fall back to a smooth resize, breaking nearest parity
+ * there. Where pixel-exact nearest across browsers matters more than off-thread
+ * decode, do the scaling on a canvas with imageSmoothingEnabled=false instead
+ * (the readback canvas below already does the 1:1 blit). For bit-exact parity
+ * vs the Python pipeline, bake resize+normalize into the ONNX graph.
+ *
+ * The center-crop branch (unused by the binary mnv4 model) stays on the canvas:
+ * createImageBitmap crops-then-resizes whereas the Python side resizes-then-crops,
+ * and replicating that exactly isn't worth it for a dead branch.
  */
-function resizeToSquare(px: PixelData, cfg: PreprocessConfig): Uint8ClampedArray {
+async function resizeToSquare(
+  px: PixelData,
+  cfg: PreprocessConfig
+): Promise<Uint8ClampedArray> {
   const S = cfg.size;
-
-  const src = getScratch("src", px.width, px.height);
-  // Cast to any: newer TS types Uint8ClampedArray as generic over ArrayBufferLike
-  // (which includes SharedArrayBuffer) and rejects it for ImageData's argument,
-  // though at runtime our buffer is always a plain ArrayBuffer. Type-only.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  src.ctx.putImageData(new ImageData(px.data as any, px.width, px.height), 0, 0);
-
   const dst = getScratch("dst", S, S);
 
   if (cfg.doCenterCrop && cfg.cropSize) {
+    const smooth = cfg.interpolation !== "nearest";
+    const src = getScratch("src", px.width, px.height);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    src.ctx.putImageData(new ImageData(px.data as any, px.width, px.height), 0, 0);
     const c = cfg.cropSize;
     const scale = c / Math.min(px.width, px.height);
     const rw = Math.round(px.width * scale);
     const rh = Math.round(px.height * scale);
     const tmp = getScratch("tmp", rw, rh);
+    tmp.ctx.imageSmoothingEnabled = smooth;
     tmp.ctx.clearRect(0, 0, rw, rh);
     tmp.ctx.drawImage(src.canvas, 0, 0, px.width, px.height, 0, 0, rw, rh);
     const cx = Math.floor((rw - S) / 2);
     const cy = Math.floor((rh - S) / 2);
+    dst.ctx.imageSmoothingEnabled = smooth;
     dst.ctx.clearRect(0, 0, S, S);
     dst.ctx.drawImage(tmp.canvas, cx, cy, S, S, 0, 0, S, S);
-  } else {
-    dst.ctx.clearRect(0, 0, S, S);
-    dst.ctx.drawImage(src.canvas, 0, 0, px.width, px.height, 0, 0, S, S);
+    return dst.ctx.getImageData(0, 0, S, S).data;
   }
 
+  // Plain square resize via createImageBitmap (off-thread, HW-accelerated).
+  const quality: ResizeQuality =
+    cfg.interpolation === "nearest" ? "pixelated" : "medium";
+  // Cast to any: newer TS types Uint8ClampedArray as generic over ArrayBufferLike
+  // (incl. SharedArrayBuffer) and rejects it for ImageData; runtime is a plain
+  // ArrayBuffer. Type-only.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const srcData = new ImageData(px.data as any, px.width, px.height);
+  const bmp = await createImageBitmap(srcData, {
+    resizeWidth: S,
+    resizeHeight: S,
+    resizeQuality: quality,
+    premultiplyAlpha: "none", // match getImageData's non-premultiplied RGBA
+  });
+  // 1:1 blit purely to read pixels back; no scaling here, so smoothing is moot.
+  dst.ctx.imageSmoothingEnabled = false;
+  dst.ctx.clearRect(0, 0, S, S);
+  dst.ctx.drawImage(bmp, 0, 0);
+  bmp.close();
   return dst.ctx.getImageData(0, 0, S, S).data;
 }
 
@@ -302,7 +330,7 @@ export async function classifyImageData(
 ): Promise<NsfwResult> {
   const tStart = now();
 
-  const rgba = resizeToSquare(px, cfg);
+  const rgba = await resizeToSquare(px, cfg);
   const data = toTensorData(rgba, cfg);
   const S = cfg.size;
   const tensor = new ort.Tensor("float32", data, [1, 3, S, S]);
@@ -341,7 +369,7 @@ export async function classifyBatch(
   const stride = 3 * S * S; // floats per image (NCHW)
   const data = new Float32Array(n * stride);
   for (let i = 0; i < n; i++) {
-    const rgba = resizeToSquare(pxs[i]!, cfg);
+    const rgba = await resizeToSquare(pxs[i]!, cfg);
     data.set(toTensorData(rgba, cfg), i * stride);
   }
 

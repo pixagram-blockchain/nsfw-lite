@@ -12,14 +12,29 @@
 # ]
 # ///
 """
-train_nsfw_hf_mnv3.py — same trainer as train_nsfw.py, but sourcing data from the
-Hugging Face `datasets` library instead of a local torchvision ImageFolder.
+train_nsfw_hf_mnv4_160.py — the LIGHTWEIGHT production trainer: the
+mobilenetv4_conv_small_050 backbone (~0.96M params) at 160px, the smallest and
+fastest member of the lineup, tuned to ship in the browser.
 
-It is identical in every way that matters to the rest of the pipeline: same
-MobileNetV3-small-050 backbone, the same RandomResizedCrop (train) /
-plain-square-resize (val) parity transforms, the same class-weighting, loop,
-and the SAME outputs — model/nsfw_mnv3.pt, model/labels.json, model/preprocess.json
-— so scripts/export_model.py and the embed/build steps work unchanged.
+Same data sources and the SAME parity transforms / outputs as the rest of the
+family — model/mnv4/nsfw_mnv4.pt, labels.json, preprocess.json — so
+scripts/export_model.py (--variant mnv4) and the embed/build steps work unchanged.
+
+Two things differ from the reference mnv4 trainer:
+  1. --img-size defaults to 160 (was native 224). For pixel-art SFW/NSFW that's
+     plenty, and at ~0.14x the compute of the full conv_small@256 it's the cheap
+     end of the lineup. The size flows into preprocess.json + the checkpoint, so
+     train-, export- and serve-time resolution stay identical (parity holds).
+  2. OPTIONAL knowledge distillation (--teacher-checkpoint): train this small
+     student to imitate a bigger, more accurate teacher (e.g. the full conv_small
+     at 256). The student matches the teacher's softened logits ON TOP OF the hard
+     labels, recovering much of the teacher's accuracy at a fraction of the cost —
+     the principled way to get "big-model accuracy in a small, fast model." OFF
+     unless a teacher is given, so by default this is simply the _050@160 trainer.
+
+The rest of the precision recipe is unchanged: Mixup (auto-disabled under
+distillation), RandomErasing, EMA, a cosine schedule with early-stop, and a
+per-epoch nsfw AUC readout. All train-only / parity-preserving.
 
 WHERE THE DATA COMES FROM (pick one):
   --nsfw-dataset R1 --sfw-dataset R2   two SEPARATE single-class Hub datasets;
@@ -36,11 +51,11 @@ reads the `nsfw` score by name, so the order never actually matters.
 RUN IT ON HUGGING FACE JOBS (GPU, no local setup — this file is a UV script):
     # Jobs are a Pro/Team/Enterprise feature. Authenticate first: `hf auth login`.
     # Your two datasets, on a big GPU, pushing the result to your account:
-    hf jobs uv run --flavor a100-large -s HF_TOKEN scripts/train_nsfw_hf_mnv3.py \
+    hf jobs uv run --flavor a100-large --timeout 2h -s HF_TOKEN scripts/train_nsfw_hf_mnv4_160.py \
         -- --nsfw-dataset wallstoneai/civitai-top-nsfw-images-with-metadata \
            --sfw-dataset  wallstoneai/civitai-top-sfw-images-with-metadata \
-           --push-repo <you>/nsfw-lite-mnv3 --epochs 12 \
-           --batch-size 256 --num-workers 16
+           --push-repo <you>/nsfw_mnv4_160 --interp nearest \
+           --batch-size 160 --num-workers 16 --patience 5
     # (you can also pass a public URL to this file instead of a local path.)
 
   GPU flavors run small -> large: t4-small, l4x1, a10g-small, a10g-large,
@@ -53,16 +68,16 @@ RUN IT ON HUGGING FACE JOBS (GPU, no local setup — this file is a UV script):
 
   HF Jobs storage is EPHEMERAL — the filesystem is wiped when the job ends. Pass
   --push-repo so the trained model/ folder is uploaded to the Hub; then locally:
-      hf download <you>/nsfw-lite-mnv3 --repo-type model --local-dir model/
-      python scripts/export_model.py --calib-data <calib-dir>
-      npm run embed-model && npm run build
+      hf download <you>/nsfw_mnv4_160 --repo-type model --local-dir model/mnv4/
+      python scripts/export_model.py --variant mnv4 --calib-data <calib-dir>
+      npm run embed:mnv4 && npm run build
 
 RUN IT LOCALLY (or in a GPU Space / notebook) the ordinary way:
     pip install "timm>=1.0.0" torch torchvision "datasets>=2.14.0" pillow numpy huggingface_hub
-    python scripts/train_nsfw_hf_mnv3.py \
+    python scripts/train_nsfw_hf_mnv4.py \
         --nsfw-dataset wallstoneai/civitai-top-nsfw-images-with-metadata \
         --sfw-dataset  wallstoneai/civitai-top-sfw-images-with-metadata
-    python scripts/train_nsfw_hf_mnv3.py --data-dir ./data   # local imagefolder
+    python scripts/train_nsfw_hf_mnv4.py --data-dir ./data   # local imagefolder
 
 RESPONSIBLE-USE NOTE: if you upload your NSFW images to a Hub dataset, make the
 repo PRIVATE or gated, review Hugging Face's current Content Policy, and screen
@@ -90,7 +105,7 @@ ALIASES = {
 }
 CANONICAL = {"sfw", "nsfw"}
 
-DEFAULT_BACKBONE = "mobilenetv3_small_050.lamb_in1k"
+DEFAULT_BACKBONE = "mobilenetv4_conv_small_050.e3000_r224_in1k"
 
 
 # torch.amp moved out of torch.cuda.amp; support both so this runs across versions.
@@ -168,37 +183,104 @@ def parse_args():
                    help="label column for --hf-dataset/--data-dir mode (default: label)")
 
     p.add_argument("--backbone", default=DEFAULT_BACKBONE,
-                   help="timm model id (default: mobilenetv3_small_050.lamb_in1k)")
-    p.add_argument("--epochs", type=int, default=12)
+                   help="timm model id (default: mobilenetv4_conv_small_050.e3000_r224_in1k, the "
+                        "~2.2M-param lightweight centerpiece — kept as-is since it's the proven "
+                        "winner). For more capacity: mobilenetv4_conv_small.e2400_r224_in1k "
+                        "(~3.8M, full width) or mobilenetv4_conv_medium.e500_r224_in1k (~9.7M).")
+    p.add_argument("--img-size", type=int, default=160,
+                   help="input resolution (DEFAULT 160 for this lightweight build). "
+                        "mnv4_conv_small_050 is fully convolutional, so this is a free lever: "
+                        "160px is ~0.14x the compute of the full conv_small at 256 and is "
+                        "plenty for pixel-art SFW/NSFW, whose source images rarely carry more "
+                        "than that. The chosen size is written into preprocess.json, so the "
+                        "browser resizes to the SAME value — train/serve parity holds. Raise it "
+                        "(e.g. 224) only if you measure a recall gain that justifies the cost.")
+    p.add_argument("--interp", default="bilinear", choices=["bilinear", "nearest"],
+                   help="resize filter applied at EVERY stage (train aug, val, and — via the "
+                        "checkpoint — calibration + the browser). 'nearest' = pixelated: crisp "
+                        "pixel blocks with no blur, the faithful choice for pixel art that is "
+                        "UPSCALED to the input size. (It ALIASES when DOWNSCALING large images, "
+                        "so prefer it when sources are small sprites at/below the input size.) "
+                        "'bilinear' (default) = smooth, matching a canvas with image smoothing on. "
+                        "The choice is recorded in the checkpoint so export + serve stay in parity "
+                        "automatically; only nearest/bilinear are offered because those are the "
+                        "two a browser <canvas> can reproduce exactly.")
+
+    # ── Optional knowledge distillation ──────────────────────────────────
+    # Train the small _050 student to imitate a bigger, more accurate teacher
+    # (e.g. the full mobilenetv4_conv_small at 256). The student learns the
+    # teacher's SOFTENED logits on top of the hard labels, recovering much of the
+    # teacher's accuracy at a fraction of the compute. All OFF unless a teacher is
+    # given, so the script is a plain _050@160 trainer by default.
+    p.add_argument("--teacher-checkpoint", default=None,
+                   help="path to a trained teacher .pt (e.g. model/mnv4_full/nsfw_mnv4.pt, a "
+                        "full conv_small trained at 256). When set, distillation is ON.")
+    p.add_argument("--teacher-backbone", default=None,
+                   help="override the teacher's backbone id (default: read it from the teacher "
+                        "checkpoint, which is the normal case).")
+    p.add_argument("--kd-alpha", type=float, default=0.7,
+                   help="distillation mix in [0,1]: loss = kd_alpha*KD + (1-kd_alpha)*CE_hard "
+                        "(default 0.7). Only used when --teacher-checkpoint is given.")
+    p.add_argument("--kd-temp", type=float, default=4.0,
+                   help="softmax temperature for the KD term (default 4.0; higher = softer "
+                        "targets that expose more of the teacher's inter-class confidence).")
+    p.add_argument("--epochs", type=int, default=20,
+                   help="max epochs (default 20; stronger aug benefits from a longer run. "
+                        "Best-by-macro-F1 checkpoint is kept, and --patience early-stops on "
+                        "plateau, so this is a ceiling, not a fixed cost).")
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--min-lr", type=float, default=1e-5,
+                   help="cosine floor (default 1e-5). The schedule decays to this instead of 0 so "
+                        "the final epochs keep learning a little rather than freezing.")
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--warmup-epochs", type=int, default=1)
+    p.add_argument("--warmup-epochs", type=int, default=2)
     p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--val-frac", type=float, default=0.1, help="used only if --val-split not given")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out-dir", default="model/mnv3")
+    p.add_argument("--out-dir", default="model/mnv4")
 
     # Augmentation / regularization knobs.
     p.add_argument("--rrc-min", type=float, default=0.8,
                    help="RandomResizedCrop lower scale bound (default 0.8). Higher = gentler "
                         "cropping; for NSFW, avoids cropping the explicit region out of frame "
                         "and stays closer to the full-frame resize used at serve time.")
-    p.add_argument("--ema", action="store_true", default=False,
+    p.add_argument("--random-erase", type=float, default=0.25,
+                   help="RandomErasing probability (default 0.25; 0 disables). Occludes a small "
+                        "patch — a cheap regularizer that, unlike heavy cropping, leaves the "
+                        "subject in frame. Train-only, so serve-time parity is untouched.")
+    p.add_argument("--mixup-alpha", type=float, default=0.1,
+                   help="Mixup alpha (default 0.1; 0 disables). Blends whole image PAIRS and their "
+                        "labels — a strong, parity-safe regularizer that smooths the decision "
+                        "boundary and improves precision on borderline images. When active, an "
+                        "unweighted soft-target loss is used (fine for a balanced set).")
+    p.add_argument("--cutmix-alpha", type=float, default=0.0,
+                   help="CutMix alpha (default 0.0 = OFF). Left off on purpose for moderation: "
+                        "pasting an sfw patch over an nsfw image's explicit region while lowering "
+                        "its label can teach under-flagging of partially-occluded content. Enable "
+                        "only if you understand that risk.")
+    p.add_argument("--mixup-prob", type=float, default=1.0,
+                   help="probability a batch is mixed when mixup/cutmix is active (default 1.0).")
+    p.add_argument("--mixup-switch-prob", type=float, default=0.5,
+                   help="prob of choosing cutmix over mixup when BOTH alphas > 0 (default 0.5).")
+    p.add_argument("--ema", dest="ema", action="store_true", default=True,
                    help="track an exponential moving average of the weights; eval both raw and "
-                        "EMA each epoch and keep whichever scores higher (pure upside).")
+                        "EMA each epoch and keep whichever scores higher (pure upside). ON by "
+                        "default for this trainer.")
+    p.add_argument("--no-ema", dest="ema", action="store_false",
+                   help="disable EMA weight averaging.")
     p.add_argument("--ema-decay", type=float, default=0.998,
                    help="EMA decay (default 0.998). Lower for short runs: the averaging window is "
                         "~1/(1-decay) steps, so 0.998≈500 steps. EMA starts after warmup.")
-    p.add_argument("--patience", type=int, default=0,
+    p.add_argument("--patience", type=int, default=5,
                    help="early-stop after this many epochs without a macro-F1 improvement "
-                        "(0 = disabled, train all --epochs). Best checkpoint is always kept.")
+                        "(default 5; 0 = disabled). Best checkpoint is always kept.")
 
     # Optional: push the trained model/ folder to the Hub (essential on HF Jobs,
     # whose local storage is wiped when the job finishes).
     p.add_argument("--push-repo", default=None,
-                   help="repo id to upload model/ to after training (e.g. you/nsfw-lite-mnv3)")
+                   help="repo id to upload model/ to after training (e.g. you/nsfw-lite-mnv4)")
     p.add_argument("--push-repo-type", default="model", choices=["model", "dataset"])
     p.add_argument("--push-private", action="store_true", default=True,
                    help="create the push repo as private (default: True)")
@@ -223,20 +305,42 @@ def normalize_labels(names):
     return labels
 
 
+def _rank_auc(scores, positive):
+    """ROC-AUC for the positive class via the Mann–Whitney U statistic — no
+    sklearn dependency. `scores` = P(nsfw) per sample, `positive` = boolean mask
+    of true-nsfw rows. Ties get arbitrary (not averaged) ranks, which is fine for
+    epoch-to-epoch monitoring since float probabilities almost never tie."""
+    scores = np.asarray(scores, dtype=np.float64)
+    positive = np.asarray(positive, dtype=bool)
+    n_pos = int(positive.sum())
+    n_neg = int(positive.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(scores.size, dtype=np.float64)
+    ranks[order] = np.arange(1, scores.size + 1)
+    return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes):
+def evaluate(model, loader, device, num_classes, nsfw_index=None):
     model.eval()
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)  # [true, pred]
     loss_sum, n = 0.0, 0
     ce = nn.CrossEntropyLoss()
+    probs_nsfw, true_y = [], []  # for threshold-independent AUC on the nsfw class
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         logits = model(x)
         loss_sum += float(ce(logits, y)) * x.size(0)
         n += x.size(0)
         pred = logits.argmax(1).cpu().numpy()
-        for t, pr in zip(y.cpu().numpy(), pred):
+        yc = y.cpu().numpy()
+        for t, pr in zip(yc, pred):
             cm[t, pr] += 1
+        if nsfw_index is not None:
+            probs_nsfw.append(torch.softmax(logits, dim=1)[:, nsfw_index].float().cpu().numpy())
+            true_y.append(yc)
     tp = np.diag(cm).astype(np.float64)
     fp = cm.sum(0) - tp
     fn = cm.sum(1) - tp
@@ -244,8 +348,14 @@ def evaluate(model, loader, device, num_classes):
     rec = tp / np.clip(tp + fn, 1, None)
     f1 = 2 * prec * rec / np.clip(prec + rec, 1e-9, None)
     acc = tp.sum() / max(1, cm.sum())
+    auc = float("nan")
+    if nsfw_index is not None and probs_nsfw:
+        scores = np.concatenate(probs_nsfw)
+        ys = np.concatenate(true_y)
+        auc = _rank_auc(scores, ys == nsfw_index)
     return {"loss": loss_sum / max(1, n), "acc": float(acc),
-            "prec": prec, "rec": rec, "f1": f1, "macro_f1": float(f1.mean()), "cm": cm}
+            "prec": prec, "rec": rec, "f1": f1, "macro_f1": float(f1.mean()),
+            "auc": auc, "cm": cm}
 
 
 def main():
@@ -389,21 +499,43 @@ def main():
     # ── Build the model first so transforms match its native size/mean/std ──
     probe = timm.create_model(args.backbone, pretrained=True, num_classes=num_classes)
     dcfg = timm.data.resolve_model_data_config(probe)
-    size = int(dcfg["input_size"][-1])
+    native_size = int(dcfg["input_size"][-1])
     mean = [float(m) for m in dcfg["mean"]]
     std = [float(s) for s in dcfg["std"]]
     del probe
-    print(f"[train] input size={size}  mean={mean}  std={std}")
+    # Resolution: default to the backbone's native size (224). mnv4_conv_small is
+    # fully convolutional, so --img-size can raise it (e.g. 256, the resolution
+    # timm evaluates this model at). The chosen size flows into the transforms AND
+    # into preprocess.json / the checkpoint below, so train-, export- and serve-
+    # time resolution all stay identical (parity preserved). mean/std are
+    # resolution-independent and still come from the backbone's data config.
+    size = int(args.img_size) if args.img_size else native_size
+    if size != native_size:
+        print(f"[train] input size={size} (overriding backbone native {native_size}px)  "
+              f"mean={mean}  std={std}")
+    else:
+        print(f"[train] input size={size}  mean={mean}  std={std}")
 
-    train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(size, scale=(args.rrc_min, 1.0)),
+    # Resize filter, shared by train aug + val so the model only ever sees one
+    # interpolation. The same choice is saved in the checkpoint and flows to
+    # calibration + the browser, so train/serve parity holds by construction.
+    interp_mode = {"bilinear": transforms.InterpolationMode.BILINEAR,
+                   "nearest": transforms.InterpolationMode.NEAREST}[args.interp]
+    train_tf_list = [
+        transforms.RandomResizedCrop(size, scale=(args.rrc_min, 1.0), interpolation=interp_mode),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(0.1, 0.1, 0.1),
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
+    ]
+    # RandomErasing operates on the tensor; place it BEFORE Normalize so the
+    # erased patch is black in [0,1] space (a real pixel value) and then gets
+    # normalized like everything else. Train-only — val/serve parity untouched.
+    if args.random_erase and args.random_erase > 0:
+        train_tf_list.append(transforms.RandomErasing(p=args.random_erase))
+    train_tf_list.append(transforms.Normalize(mean, std))
+    train_tf = transforms.Compose(train_tf_list)
     val_tf = transforms.Compose([
-        transforms.Resize((size, size)),  # plain resize == the browser's canvas resize
+        transforms.Resize((size, size), interpolation=interp_mode),  # == the browser canvas resize
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
@@ -450,18 +582,94 @@ def main():
 
     # ── Train ────────────────────────────────────────────────────────────
     model = timm.create_model(args.backbone, pretrained=True, num_classes=num_classes).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=args.label_smoothing)
+
+    # Mixup/CutMix (timm). Blends image pairs + labels into soft targets — a
+    # strong, train-only regularizer (val/serve parity is untouched). When it's
+    # active the loss MUST be a soft-target CE; the per-class weighting is dropped
+    # (it doesn't compose with soft targets), which is a no-op on a balanced set.
+    # Mixup already smooths the labels, so we hand it --label-smoothing and don't
+    # double-smooth in the loss.
+    mixup_active = (args.mixup_alpha > 0.0 or args.cutmix_alpha > 0.0)
+    mixup_fn = None
+    if mixup_active:
+        # timm's Mixup asserts an even batch size. drop_last=True means every
+        # batch is exactly --batch-size, so an odd value would fail every step;
+        # catch it now with a clear message rather than mid-training.
+        if args.batch_size % 2 != 0:
+            raise SystemExit(
+                f"[train] --batch-size must be even when mixup/cutmix is active "
+                f"(got {args.batch_size}). Use an even size, or disable mixup with "
+                f"--mixup-alpha 0 --cutmix-alpha 0."
+            )
+        from timm.data import Mixup
+        from timm.loss import SoftTargetCrossEntropy
+        mixup_fn = Mixup(
+            mixup_alpha=args.mixup_alpha, cutmix_alpha=args.cutmix_alpha,
+            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob,
+            mode="batch", label_smoothing=args.label_smoothing, num_classes=num_classes,
+        )
+        criterion = SoftTargetCrossEntropy()
+        print(f"[train] mixup on (mixup_alpha={args.mixup_alpha}, cutmix_alpha={args.cutmix_alpha}, "
+              f"prob={args.mixup_prob}); soft-target loss, class-weighting disabled under mixup")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=args.label_smoothing)
+
+    # ── Optional teacher for knowledge distillation ──────────────────────
+    teacher = None
+    to_teacher_input = None
+    if args.teacher_checkpoint:
+        tck = torch.load(args.teacher_checkpoint, map_location="cpu", weights_only=False)
+        t_backbone = args.teacher_backbone or tck["backbone"]
+        teacher = timm.create_model(t_backbone, pretrained=False, num_classes=num_classes)
+        teacher.load_state_dict(tck["state_dict"])
+        teacher.eval().to(device)
+        for tp in teacher.parameters():
+            tp.requires_grad_(False)
+        t_size = int(tck.get("size", size))
+        # The teacher may normalize its input differently from the student (the
+        # full conv_small uses ImageNet mean/std; the _050 student uses
+        # 0.5/0.5/0.5) AND was trained at its own resolution. The batch is already
+        # normalized with the STUDENT'S stats at the STUDENT'S size, so to feed the
+        # teacher we undo that, resize to the teacher's resolution, then re-apply
+        # the teacher's stats — all cheap, all on-device.
+        s_mean = torch.tensor(mean, device=device).view(1, 3, 1, 1)
+        s_std = torch.tensor(std, device=device).view(1, 3, 1, 1)
+        t_mean = torch.tensor([float(x) for x in tck["mean"]], device=device).view(1, 3, 1, 1)
+        t_std = torch.tensor([float(x) for x in tck["std"]], device=device).view(1, 3, 1, 1)
+
+        def to_teacher_input(xb):
+            x01 = xb * s_std + s_mean  # student-normalized -> [0,1]
+            if t_size != size:
+                x01 = nn.functional.interpolate(x01, size=(t_size, t_size),
+                                                 mode="bilinear", align_corners=False)
+            return (x01 - t_mean) / t_std
+
+        # KD already supplies soft targets; stacking mixup on top over-regularizes
+        # a tiny student, so disable mixup under distillation and use the weighted
+        # hard-label CE for the (1 - kd_alpha) term.
+        if mixup_fn is not None:
+            print("[train] distillation ON -> disabling mixup (KD already provides soft "
+                  "targets; both at once over-regularizes the small student).")
+            mixup_fn = None
+            criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=args.label_smoothing)
+        print(f"[train] distillation ON: teacher={t_backbone} @ {t_size}px "
+              f"(kd_alpha={args.kd_alpha}, T={args.kd_temp}); the {size}px student batch is "
+              f"re-normalized + resized to the teacher before its forward pass.")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     steps_per_epoch = max(1, len(train_loader))
     warmup_steps = args.warmup_epochs * steps_per_epoch
     total_steps = args.epochs * steps_per_epoch
+    # Cosine decays to a floor of min_lr/lr (not 0) so the tail keeps learning.
+    lr_floor = min(1.0, max(0.0, args.min_lr / args.lr)) if args.lr > 0 else 0.0
 
     def lr_at(step):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         prog = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+        cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+        return lr_floor + (1.0 - lr_floor) * cos
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_at)
     use_amp = device == "cuda"
@@ -481,19 +689,83 @@ def main():
             "size": size,
             "mean": mean,
             "std": std,
+            "interp": args.interp,
             "macro_f1": f1,
         }, best_path)
 
-    best_f1, best_path = -1.0, os.path.join(args.out_dir, "nsfw_mnv3.pt")
+    best_f1, best_path = -1.0, os.path.join(args.out_dir, "nsfw_mnv4.pt")
+
+    # ---- robustness: write sidecars up front + push best ckpt incrementally ----
+    def write_sidecars():
+        # labels.json + preprocess.json never change during training, so write them
+        # ONCE up front. That way a checkpoint pushed mid-run (e.g. right before a
+        # job timeout) lands on the Hub as a COMPLETE, immediately-usable model.
+        with open(os.path.join(args.out_dir, "labels.json"), "w") as f:
+            json.dump(labels, f)
+        preprocess = {
+            "size": size, "cropSize": None, "doCenterCrop": False,
+            "rescaleFactor": 1.0 / 255.0, "rescaleOffset": False,
+            "doNormalize": True, "mean": mean, "std": std, "includeTop": False,
+        }
+        with open(os.path.join(args.out_dir, "preprocess.json"), "w") as f:
+            json.dump(preprocess, f, indent=2)
+    write_sidecars()
+
+    # Push out_dir to the Hub. Used (a) every time the best checkpoint improves —
+    # so a timed-out/killed job still leaves the best-so-far weights on the Hub
+    # instead of losing everything to ephemeral job storage — and (b) as a final
+    # sync after training. Failures here are NON-FATAL: the run keeps going.
+    push_api = None
+    if args.push_repo:
+        from huggingface_hub import HfApi
+        push_api = HfApi()  # uses HF_TOKEN from the environment / job secret
+        try:
+            push_api.create_repo(repo_id=args.push_repo, repo_type=args.push_repo_type,
+                                 private=args.push_private, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[train] !! could not pre-create {args.push_repo} (will retry at push): {e}")
+
+    def push_hub(tag):
+        if push_api is None:
+            return
+        try:
+            push_api.upload_folder(folder_path=args.out_dir, repo_id=args.push_repo,
+                                  repo_type=args.push_repo_type,
+                                  commit_message=f"{tag} (macroF1={best_f1:.4f})")
+            print(f"[train] pushed {tag} -> {args.push_repo} (macroF1={best_f1:.4f})")
+        except Exception as e:  # noqa: BLE001
+            print(f"[train] !! push of '{tag}' failed (continuing; weights saved locally): {e}")
     no_improve = 0
     gstep = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         for bi, (x, y) in enumerate(train_loader):
             x, y = x.to(device, non_blocking=pin), y.to(device, non_blocking=pin)
+            # Mix BEFORE autocast so label interpolation stays in fp32. mixup_fn
+            # turns y into soft targets [B, num_classes]; without it we keep the
+            # hard integer labels for the weighted CE path.
+            if mixup_fn is not None:
+                x, target = mixup_fn(x, y)
+            else:
+                target = y
             optimizer.zero_grad(set_to_none=True)
             with amp_ctx(use_amp):
-                loss = criterion(model(x), y)
+                student_logits = model(x)
+                if teacher is not None:
+                    # Soft-target distillation (Hinton): match the teacher's
+                    # temperature-softened logits, scaled by T^2 to keep the
+                    # gradient magnitude comparable to the hard-label term.
+                    with torch.no_grad():
+                        teacher_logits = teacher(to_teacher_input(x))
+                    T = args.kd_temp
+                    kd = nn.functional.kl_div(
+                        nn.functional.log_softmax(student_logits / T, dim=1),
+                        nn.functional.softmax(teacher_logits / T, dim=1),
+                        reduction="batchmean",
+                    ) * (T * T)
+                    loss = args.kd_alpha * kd + (1.0 - args.kd_alpha) * criterion(student_logits, target)
+                else:
+                    loss = criterion(student_logits, target)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -516,17 +788,19 @@ def main():
 
         improved = False
         for tag, net in candidates:
-            m = evaluate(net, val_loader, device, num_classes)
+            m = evaluate(net, val_loader, device, num_classes, nsfw_index=nsfw_i)
             per_f1 = ", ".join(f"{l}={f:.3f}" for l, f in zip(labels, m["f1"]))
             label = f"[val:{tag}]" if len(candidates) > 1 else "[val]"
             print(f"{label} epoch {epoch}: loss={m['loss']:.4f} acc={m['acc']:.4f} "
                   f"macroF1={m['macro_f1']:.4f} | F1[{per_f1}]")
-            print(f"      nsfw recall={m['rec'][nsfw_i]:.3f}  nsfw precision={m['prec'][nsfw_i]:.3f}")
+            print(f"      nsfw recall={m['rec'][nsfw_i]:.3f}  nsfw precision={m['prec'][nsfw_i]:.3f}  "
+                  f"nsfw AUC={m['auc']:.4f}")
             if m["macro_f1"] > best_f1:
                 best_f1 = m["macro_f1"]
                 save_ckpt(net, best_f1)
                 print(f"[train] saved best ({tag}, macroF1={best_f1:.4f}) -> {best_path}")
                 improved = True
+                push_hub("best checkpoint")
 
         # Early stopping (best checkpoint already saved above; safe to stop).
         if args.patience > 0:
@@ -536,16 +810,8 @@ def main():
                       f"epoch(s) (best={best_f1:.4f}).")
                 break
 
-    # Emit labels + preprocess for the export/JS side (same as train_nsfw.py).
-    with open(os.path.join(args.out_dir, "labels.json"), "w") as f:
-        json.dump(labels, f)
-    preprocess = {
-        "size": size, "cropSize": None, "doCenterCrop": False,
-        "rescaleFactor": 1.0 / 255.0, "rescaleOffset": False,
-        "doNormalize": True, "mean": mean, "std": std, "includeTop": False,
-    }
-    with open(os.path.join(args.out_dir, "preprocess.json"), "w") as f:
-        json.dump(preprocess, f, indent=2)
+    # labels.json + preprocess.json were already written up front by
+    # write_sidecars(), so any checkpoint pushed mid-run is already complete.
 
     print(f"\n[train] done. best macroF1={best_f1:.4f}")
 
@@ -573,7 +839,7 @@ def main():
             print("[train]     fix the token and re-run, or run locally where ./model/ persists.)")
             raise SystemExit(1)
 
-    print("[train] next:  python scripts/export_model.py --checkpoint model/mnv3/nsfw_mnv3.pt --calib-data <calib-dir> --out-dir model/mnv3")
+    print("[train] next:  python scripts/export_model.py --variant mnv4 --calib-data <calib-dir>")
     print("[train] then:  npm run embed-model && npm run build")
 
 

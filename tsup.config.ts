@@ -1,13 +1,13 @@
 import { defineConfig } from "tsup";
 
-// One self-contained bundle per model variant. Each emits:
-//   dist/<variant>/index.{js,cjs,d.ts}   — public API, embeds ONLY its model
-//   dist/<variant>/worker.{js,d.ts}      — its own worker copy (no model)
-// The variant's index references its worker via
+// One self-contained bundle for the mnv4 variant. It emits:
+//   dist/mnv4/index.{js,cjs,d.ts}   — public API, embeds the model
+//   dist/mnv4/worker.{js,d.ts}      — its worker copy (no model)
+// The index references its worker via
 //   new Worker(new URL("./worker.js", import.meta.url))
 // which Vite / webpack 5 / Rollup detect statically and bundle; esbuild leaves
-// that URL intact so it resolves to the sibling dist/<variant>/worker.js.
-const VARIANTS = ["mnv4", "mnv3", "tinynet", "lcnet"] as const;
+// that URL intact so it resolves to the sibling dist/mnv4/worker.js.
+const VARIANTS = ["mnv4"] as const;
 
 const entry: Record<string, string> = {};
 for (const v of VARIANTS) {

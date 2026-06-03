@@ -15,7 +15,7 @@ export interface GeneratedAssets {
 
 /** Resolved, ready-to-use embedded assets for a single model variant. */
 export interface Embedded {
-  /** Decoded INT8 ONNX bytes. Throws if this variant has no embedded model. */
+  /** Decoded uint8-quantized ONNX bytes. Throws if no model is embedded. */
   getModelBytes(): Uint8Array;
   /** Class label order (lowercased), e.g. ["nsfw", "sfw"]. */
   labels: string[];
@@ -24,26 +24,26 @@ export interface Embedded {
 }
 
 /**
- * timm preprocessing fallback. These are a fallback ONLY — the build pipeline
- * (scripts/export_model.py) reads the REAL values from each backbone's data
- * config and the embed step bakes them into assets.generated.ts, overriding
- * these. They are deliberately generic and are NOT correct for every backbone:
- * e.g. `tinynet_e` is 106×106 (not 224) and `lcnet_050` uses inception
- * mean/std (0.5/0.5/0.5). They only take effect if a variant somehow has no
- * embedded preprocess — and such a variant has no embedded model either, so it
- * throws at getModelBytes() before any inference runs. Do not rely on them for
- * accuracy; verify against the emitted preprocess.json.
+ * Preprocessing fallback. This is a fallback ONLY — the build pipeline
+ * (scripts/export_model.py) reads the REAL values from the checkpoint's timm
+ * data config and the embed step bakes them into assets.generated.ts,
+ * overriding these. They take effect only if the embedded preprocess is somehow
+ * missing — in which case there is no embedded model either, so getModelBytes()
+ * throws before any inference runs. Do not rely on them for accuracy; verify
+ * against the emitted preprocess.json. (Values match the mnv4 build:
+ * mobilenetv4_conv_small_050 at 160px with inception mean/std 0.5/0.5/0.5.)
  */
 export const DEFAULT_PREPROCESS: PreprocessConfig = {
-  size: 224, // generic fallback only — real size comes from preprocess.json (tinynet_e = 106)
+  size: 160, // fallback only — real size comes from preprocess.json
   cropSize: null,
   doCenterCrop: false,
   rescaleFactor: 1 / 255,
   rescaleOffset: false,
   doNormalize: true,
-  mean: [0.485, 0.456, 0.406],
-  std: [0.229, 0.224, 0.225],
+  mean: [0.5, 0.5, 0.5],
+  std: [0.5, 0.5, 0.5],
   includeTop: false,
+  interpolation: "bilinear", // fallback; real value (nearest/bilinear) from preprocess.json
 };
 
 /**
