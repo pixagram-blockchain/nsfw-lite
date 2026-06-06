@@ -70,6 +70,9 @@ export async function loadSession(
   opts: RuntimeOptions = {}
 ): Promise<Session> {
   configureRuntime(opts);
+  // Launch-time: learn once whether createImageBitmap honours "pixelated", so
+  // the first real image doesn't pay for the probe (memoised; see core helpers).
+  void probeBitmapCaps();
 
   const pref = opts.backend ?? "auto";
   const hasGPU =
@@ -149,27 +152,123 @@ function getScratch(slot: string, w: number, h: number): Scratch {
   return s;
 }
 
+// --- createImageBitmap capability probe (run once at launch) ----------------
+// resizeQuality:"pixelated" is a browser-dependent HINT — some engines (notably
+// Firefox, historically) silently ignore it and resize smoothly, which breaks
+// nearest-neighbour parity for pixel art. We detect that empirically, once: a
+// known black/white pattern upscaled with "pixelated" stays pure if the hint is
+// honoured, and grows gray midtones if it fell back to smoothing. When it's not
+// honoured (or createImageBitmap can't resize at all) we scale on a 2D canvas
+// with imageSmoothingEnabled=false instead — the reliable nearest path.
+interface BitmapCaps {
+  /** createImageBitmap exists AND obeys resizeWidth/resizeHeight. */
+  resize: boolean;
+  /** resizeQuality:"pixelated" produces true nearest-neighbour (not smoothing). */
+  pixelated: boolean;
+}
+
+let bitmapCapsPromise: Promise<BitmapCaps> | null = null;
+
+function probeBitmapCaps(): Promise<BitmapCaps> {
+  if (bitmapCapsPromise) return bitmapCapsPromise;
+  bitmapCapsPromise = (async (): Promise<BitmapCaps> => {
+    if (
+      typeof createImageBitmap === "undefined" ||
+      typeof OffscreenCanvas === "undefined"
+    ) {
+      return { resize: false, pixelated: false };
+    }
+    try {
+      // 4 source px (black, white, black, white) upscaled 4× to 16 px wide.
+      const probe = new Uint8ClampedArray(4 * 4); // 4 px · RGBA
+      for (let i = 0; i < 4; i++) {
+        const v = i % 2 === 0 ? 0 : 255;
+        probe[i * 4] = v;
+        probe[i * 4 + 1] = v;
+        probe[i * 4 + 2] = v;
+        probe[i * 4 + 3] = 255;
+      }
+      const W = 16;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const bmp = await createImageBitmap(new ImageData(probe as any, 4, 1), {
+        resizeWidth: W,
+        resizeHeight: 1,
+        resizeQuality: "pixelated",
+        premultiplyAlpha: "none",
+      });
+      const resize = bmp.width === W && bmp.height === 1;
+
+      let pixelated = false;
+      const cx = new OffscreenCanvas(W, 1).getContext("2d", {
+        willReadFrequently: true,
+      }) as OffscreenCanvasRenderingContext2D | null;
+      if (cx && resize) {
+        cx.imageSmoothingEnabled = false; // 1:1 readback blit; no scaling here
+        cx.drawImage(bmp, 0, 0);
+        const out = cx.getImageData(0, 0, W, 1).data;
+        pixelated = true;
+        for (let i = 0; i < out.length; i += 4) {
+          // True nearest => every pixel is exactly 0 or 255 (allow ±1 rounding).
+          if (out[i]! > 1 && out[i]! < 254) {
+            pixelated = false;
+            break;
+          }
+        }
+      }
+      bmp.close();
+      return { resize, pixelated };
+    } catch {
+      // resize options unsupported, OffscreenCanvas readback blocked, etc.
+      return { resize: false, pixelated: false };
+    }
+  })();
+  return bitmapCapsPromise;
+}
+
+/** How a non-square source is mapped onto the square model input. */
+type FitMode = "squash" | "border" | "center";
+
+/**
+ * Geometry for fitting a `sw`×`sh` source into an `S`×`S` box.
+ *   squash — fill the box, ignore aspect ratio (dw=dh=S, no offset).
+ *   border — preserve AR, fit INSIDE the box; the remainder is padded (ox,oy≥0).
+ *   center — preserve AR, COVER the box; the overflow is cropped (ox,oy≤0).
+ */
+function computeRect(
+  sw: number,
+  sh: number,
+  S: number,
+  mode: FitMode
+): { dw: number; dh: number; ox: number; oy: number } {
+  if (mode === "squash") return { dw: S, dh: S, ox: 0, oy: 0 };
+  const scale =
+    mode === "border" ? Math.min(S / sw, S / sh) : Math.max(S / sw, S / sh);
+  const dw = Math.max(1, Math.round(sw * scale));
+  const dh = Math.max(1, Math.round(sh * scale));
+  return { dw, dh, ox: Math.floor((S - dw) / 2), oy: Math.floor((S - dh) / 2) };
+}
+
 /**
  * Resize source pixels to the model's square input.
  *
- * The plain-resize path (this model: doCenterCrop=false) uses createImageBitmap,
- * which scales off the main thread and can be hardware-accelerated. The resize
- * filter follows cfg.interpolation via resizeQuality: "nearest" -> "pixelated"
- * (crisp blocks, the pixel-art choice), otherwise "medium" (smooth). A single
- * 1:1 readback canvas then extracts the RGBA bytes (ImageBitmap pixels can't be
- * read without a canvas; there is no scaling on it, so smoothing is irrelevant).
+ * Fit mode (cfg.resizeMode) controls how a non-square source becomes S×S:
+ *   "squash" — stretch to S×S, ignore aspect ratio (default; == the old
+ *              doCenterCrop:false behaviour, timm crop_mode="squash").
+ *   "border" — preserve AR, fit inside, pad the margins with cfg.padColor
+ *              (letterbox; timm crop_mode="border", fill = padColor).
+ *   "center" — preserve AR, scale the shorter side to S, center-crop to S×S
+ *              (timm crop_mode="center", crop_pct ≈ 1).
+ * Pick the mode your model was TRAINED with — a serve-side change the training
+ * pipeline didn't make reintroduces a train/serve skew.
  *
- * PARITY CAVEAT: resizeQuality is browser-dependent and not uniformly supported
- * — notably Firefox's support for it has been incomplete, so "pixelated" may be
- * silently ignored and fall back to a smooth resize, breaking nearest parity
- * there. Where pixel-exact nearest across browsers matters more than off-thread
- * decode, do the scaling on a canvas with imageSmoothingEnabled=false instead
- * (the readback canvas below already does the 1:1 blit). For bit-exact parity
- * vs the Python pipeline, bake resize+normalize into the ONNX graph.
- *
- * The center-crop branch (unused by the binary mnv4 model) stays on the canvas:
- * createImageBitmap crops-then-resizes whereas the Python side resizes-then-crops,
- * and replicating that exactly isn't worth it for a dead branch.
+ * Resize backend: createImageBitmap (off-thread, HW-accelerated) is used when it
+ * can resize AND — for the "nearest" filter — actually honours "pixelated"
+ * (decided once by probeBitmapCaps). Otherwise we scale on a 2D canvas with
+ * imageSmoothingEnabled forced off, the reliable nearest path on engines that
+ * ignore the hint. The scaled image is composited at (ox,oy): for "border" that
+ * centres it over the pad; for "center" the offset is negative so the canvas
+ * clips the overflow. For bit-exact parity vs the Python pipeline, bake
+ * resize+normalize into the ONNX graph.
  */
 async function resizeToSquare(
   px: PixelData,
@@ -177,47 +276,49 @@ async function resizeToSquare(
 ): Promise<Uint8ClampedArray> {
   const S = cfg.size;
   const dst = getScratch("dst", S, S);
+  const nearest = cfg.interpolation === "nearest";
+  const mode: FitMode = cfg.resizeMode ?? (cfg.doCenterCrop ? "center" : "squash");
+  const { dw, dh, ox, oy } = computeRect(px.width, px.height, S, mode);
 
-  if (cfg.doCenterCrop && cfg.cropSize) {
-    const smooth = cfg.interpolation !== "nearest";
+  // Only "border" leaves uncovered pixels: paint the pad so the letterbox
+  // margins are a known constant rather than stale canvas content. The other
+  // modes fully cover S×S, so a clear is enough (transparent reads back as 0).
+  if (mode === "border") {
+    const pad: [number, number, number] = cfg.padColor ?? [0, 0, 0];
+    dst.ctx.fillStyle = `rgb(${pad[0]}, ${pad[1]}, ${pad[2]})`;
+    dst.ctx.fillRect(0, 0, S, S);
+  } else {
+    dst.ctx.clearRect(0, 0, S, S);
+  }
+
+  const caps = await probeBitmapCaps();
+  const useBitmap = caps.resize && (!nearest || caps.pixelated);
+
+  if (useBitmap) {
+    // Cast to any: newer TS types Uint8ClampedArray as generic over
+    // ArrayBufferLike (incl. SharedArrayBuffer) and rejects it for ImageData;
+    // runtime is a plain ArrayBuffer. Type-only.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const srcData = new ImageData(px.data as any, px.width, px.height);
+    const bmp = await createImageBitmap(srcData, {
+      resizeWidth: dw,
+      resizeHeight: dh,
+      resizeQuality: nearest ? "pixelated" : "medium",
+      premultiplyAlpha: "none", // match getImageData's non-premultiplied RGBA
+    });
+    dst.ctx.imageSmoothingEnabled = false; // 1:1 composite at (ox,oy); no scaling
+    dst.ctx.drawImage(bmp, ox, oy);
+    bmp.close();
+  } else {
+    // Canvas fallback: the scale happens in this drawImage. smoothing off =
+    // nearest, on = the browser's smooth filter.
     const src = getScratch("src", px.width, px.height);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     src.ctx.putImageData(new ImageData(px.data as any, px.width, px.height), 0, 0);
-    const c = cfg.cropSize;
-    const scale = c / Math.min(px.width, px.height);
-    const rw = Math.round(px.width * scale);
-    const rh = Math.round(px.height * scale);
-    const tmp = getScratch("tmp", rw, rh);
-    tmp.ctx.imageSmoothingEnabled = smooth;
-    tmp.ctx.clearRect(0, 0, rw, rh);
-    tmp.ctx.drawImage(src.canvas, 0, 0, px.width, px.height, 0, 0, rw, rh);
-    const cx = Math.floor((rw - S) / 2);
-    const cy = Math.floor((rh - S) / 2);
-    dst.ctx.imageSmoothingEnabled = smooth;
-    dst.ctx.clearRect(0, 0, S, S);
-    dst.ctx.drawImage(tmp.canvas, cx, cy, S, S, 0, 0, S, S);
-    return dst.ctx.getImageData(0, 0, S, S).data;
+    dst.ctx.imageSmoothingEnabled = !nearest;
+    dst.ctx.drawImage(src.canvas, 0, 0, px.width, px.height, ox, oy, dw, dh);
   }
 
-  // Plain square resize via createImageBitmap (off-thread, HW-accelerated).
-  const quality: ResizeQuality =
-    cfg.interpolation === "nearest" ? "pixelated" : "medium";
-  // Cast to any: newer TS types Uint8ClampedArray as generic over ArrayBufferLike
-  // (incl. SharedArrayBuffer) and rejects it for ImageData; runtime is a plain
-  // ArrayBuffer. Type-only.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const srcData = new ImageData(px.data as any, px.width, px.height);
-  const bmp = await createImageBitmap(srcData, {
-    resizeWidth: S,
-    resizeHeight: S,
-    resizeQuality: quality,
-    premultiplyAlpha: "none", // match getImageData's non-premultiplied RGBA
-  });
-  // 1:1 blit purely to read pixels back; no scaling here, so smoothing is moot.
-  dst.ctx.imageSmoothingEnabled = false;
-  dst.ctx.clearRect(0, 0, S, S);
-  dst.ctx.drawImage(bmp, 0, 0);
-  bmp.close();
   return dst.ctx.getImageData(0, 0, S, S).data;
 }
 

@@ -53,7 +53,8 @@ CALIBRATION & PIXEL ART: static-quant scales are only as good as the calibration
 distribution, so --calib-data must be representative of what you serve. For a
 pixel-art classifier, point it at actual pixel art (limited palettes / hard edges
 produce different activation ranges than natural photos). The calibration resize
-mirrors the training/serve transform (square bilinear) — keep them identical.
+mirrors the training/serve transform — same filter (interp) AND same aspect-ratio
+fit (crop_mode) — so train, calibrate, and serve stay on identical geometry.
 """
 import argparse
 import glob
@@ -109,6 +110,34 @@ def softmax(z):
     return e / e.sum()
 
 
+def fit_square(img, size, crop_mode, resample, pad_color=(0, 0, 0)):
+    """Map an arbitrary-aspect PIL image to a `size`x`size` RGB image with the
+    SAME geometry as the browser's resizeToSquare (src/core.ts), so calibration
+    and serve preprocessing agree:
+      "squash" — stretch to size x size, ignore aspect ratio.
+      "border" — preserve aspect ratio, fit INSIDE, pad the margins with
+                 pad_color (letterbox).
+      "center" — preserve aspect ratio, scale the shorter side to size, then
+                 center-crop to size x size.
+    Dims use round-half-up and offsets use floor to mirror JS Math.round /
+    Math.floor; canvas vs PIL still won't be bit-identical on non-integer scales
+    (bake resize into the ONNX graph if you need that)."""
+    w, h = img.size
+    if crop_mode == "squash" or w == 0 or h == 0:
+        return img.resize((size, size), resample)
+    scale = min(size / w, size / h) if crop_mode == "border" else max(size / w, size / h)
+    dw = max(1, int(w * scale + 0.5))
+    dh = max(1, int(h * scale + 0.5))
+    resized = img.resize((dw, dh), resample)
+    ox = (size - dw) // 2  # >=0 for "border", <=0 for "center"; matches Math.floor
+    oy = (size - dh) // 2
+    if crop_mode == "border":
+        canvas = Image.new("RGB", (size, size), tuple(pad_color))
+        canvas.paste(resized, (ox, oy))
+        return canvas
+    return resized.crop((-ox, -oy, -ox + size, -oy + size))  # center-crop window
+
+
 def _rm(path):
     """Remove a model file and any external-data sidecar it may have produced."""
     for f in (path, path + ".data", os.path.splitext(path)[0] + ".data"):
@@ -157,8 +186,24 @@ def main():
     interp = str(ckpt.get("interp", "bilinear"))
     _RES = getattr(Image, "Resampling", Image)  # Pillow >=9.1 moved the enum
     pil_resample = {"bilinear": _RES.BILINEAR, "nearest": _RES.NEAREST}.get(interp, _RES.BILINEAR)
+    # Aspect-ratio fit the model was trained with — the timm crop_mode. Like
+    # `interp`, it drives BOTH calibration (fit_square) and preprocess.json, so
+    # train, calibrate, and serve share one geometry. Read an explicit checkpoint
+    # field first, then a stored timm data_config, else fall back to "squash" —
+    # the plain square resize the rest of this pipeline has always used
+    # (doCenterCrop=False). Have the trainer persist ckpt["crop_mode"] alongside
+    # ckpt["interp"] so this is never guessed.
+    crop_mode = ckpt.get("crop_mode")
+    if crop_mode is None:
+        crop_mode = (ckpt.get("data_config") or {}).get("crop_mode")
+    crop_mode = str(crop_mode or "squash").lower()
+    if crop_mode not in ("squash", "border", "center"):
+        print(f"[export] WARNING: unknown crop_mode {crop_mode!r} in checkpoint; using 'squash'")
+        crop_mode = "squash"
+    # Letterbox pad colour for crop_mode="border" (matches the JS padColor default).
+    pad_color = tuple(int(c) for c in (ckpt.get("pad_color") or (0, 0, 0)))[:3]
     num_classes = len(labels)
-    print(f"[export] backbone={backbone}  classes={labels}  size={size}  interp={interp}")
+    print(f"[export] backbone={backbone}  classes={labels}  size={size}  interp={interp}  crop_mode={crop_mode}")
     if num_classes != 2:
         print(f"[export] WARNING: expected 2 classes for the binary model, got {num_classes}")
 
@@ -241,12 +286,18 @@ def main():
     # Re-emit labels + preprocess so the package is reproducible from the checkpoint.
     with open(os.path.join(out_dir, "labels.json"), "w") as f:
         json.dump(labels, f)
+    # resizeMode is authoritative for aspect-ratio handling in the browser; the
+    # legacy cropSize/doCenterCrop fields stay inert (resizeMode supersedes them
+    # in core.ts). padColor only matters for "border" and mirrors the JS default.
     preprocess = {
         "size": size, "cropSize": None, "doCenterCrop": False,
         "rescaleFactor": 1.0 / 255.0, "rescaleOffset": False,
         "doNormalize": True, "mean": mean, "std": std, "includeTop": False,
         "interpolation": interp,
+        "resizeMode": crop_mode,
     }
+    if crop_mode == "border":
+        preprocess["padColor"] = list(pad_color)
     with open(os.path.join(out_dir, "preprocess.json"), "w") as f:
         json.dump(preprocess, f, indent=2)
 
@@ -276,7 +327,8 @@ def main():
     input_name = ort.InferenceSession(quant_src, providers=["CPUExecutionProvider"]).get_inputs()[0].name
 
     def preprocess_img(path):
-        img = Image.open(path).convert("RGB").resize((size, size), pil_resample)
+        img = Image.open(path).convert("RGB")
+        img = fit_square(img, size, crop_mode, pil_resample, pad_color)  # same geometry as serve
         arr = np.asarray(img).astype(np.float32) / 255.0          # HWC, [0,1]
         arr = (arr - np.array(mean, np.float32)) / np.array(std, np.float32)
         arr = np.transpose(arr, (2, 0, 1))[None, ...]             # NCHW

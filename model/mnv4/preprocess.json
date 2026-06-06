@@ -16,5 +16,6 @@
     0.5
   ],
   "includeTop": false,
-  "interpolation": "nearest"
+  "interpolation": "nearest",
+  "resizeMode": "squash"
 }
