@@ -44,22 +44,10 @@ export interface PreprocessConfig {
    */
   interpolation?: "nearest" | "bilinear";
   /**
-   * How a non-square source is fit to the square input. MUST match the timm
-   * crop_mode used at train time, or you reintroduce a train/serve skew:
-   *   "squash" — resize to size×size ignoring aspect ratio (timm "squash").
-   *              The default; this is what doCenterCrop:false meant.
-   *   "border" — preserve AR, fit inside size×size, pad the rest (letterbox;
-   *              timm "border", fill = padColor).
-   *   "center" — preserve AR, scale shorter side to size, center-crop to size
-   *              (timm "center", crop_pct ≈ 1).
-   * Defaults to "center" when doCenterCrop is true (back-compat), else "squash".
-   * Bake it from the checkpoint's crop_mode in export_model.py, the same way
-   * `interpolation` is threaded, so train and serve can't desync.
-   */
-  resizeMode?: "squash" | "border" | "center";
-  /**
-   * Letterbox pad colour for resizeMode:"border", [r, g, b] 0–255.
-   * Default black [0, 0, 0] (matches timm "border" fill=0).
+   * Letterbox pad colour, [r, g, b] 0–255. Default black [0, 0, 0]. The model
+   * input is always produced by letterboxing (preserve aspect ratio, fit inside
+   * `size`, pad the rest); these are the bar pixels. Match the pad the model was
+   * trained with (export_model.py bakes it from the checkpoint).
    */
   padColor?: [number, number, number];
 }

@@ -225,50 +225,21 @@ function probeBitmapCaps(): Promise<BitmapCaps> {
   return bitmapCapsPromise;
 }
 
-/** How a non-square source is mapped onto the square model input. */
-type FitMode = "squash" | "border" | "center";
-
 /**
- * Geometry for fitting a `sw`×`sh` source into an `S`×`S` box.
- *   squash — fill the box, ignore aspect ratio (dw=dh=S, no offset).
- *   border — preserve AR, fit INSIDE the box; the remainder is padded (ox,oy≥0).
- *   center — preserve AR, COVER the box; the overflow is cropped (ox,oy≤0).
- */
-function computeRect(
-  sw: number,
-  sh: number,
-  S: number,
-  mode: FitMode
-): { dw: number; dh: number; ox: number; oy: number } {
-  if (mode === "squash") return { dw: S, dh: S, ox: 0, oy: 0 };
-  const scale =
-    mode === "border" ? Math.min(S / sw, S / sh) : Math.max(S / sw, S / sh);
-  const dw = Math.max(1, Math.round(sw * scale));
-  const dh = Math.max(1, Math.round(sh * scale));
-  return { dw, dh, ox: Math.floor((S - dw) / 2), oy: Math.floor((S - dh) / 2) };
-}
-
-/**
- * Resize source pixels to the model's square input.
- *
- * Fit mode (cfg.resizeMode) controls how a non-square source becomes S×S:
- *   "squash" — stretch to S×S, ignore aspect ratio (default; == the old
- *              doCenterCrop:false behaviour, timm crop_mode="squash").
- *   "border" — preserve AR, fit inside, pad the margins with cfg.padColor
- *              (letterbox; timm crop_mode="border", fill = padColor).
- *   "center" — preserve AR, scale the shorter side to S, center-crop to S×S
- *              (timm crop_mode="center", crop_pct ≈ 1).
- * Pick the mode your model was TRAINED with — a serve-side change the training
- * pipeline didn't make reintroduces a train/serve skew.
+ * Resize source pixels to the model's square input by LETTERBOXING: preserve the
+ * source aspect ratio, fit the whole image inside S x S, and pad the margins with
+ * cfg.padColor (default black). This is the ONLY fit mode — cropping would drop
+ * content at the edges and squashing would distort wide images, both of which
+ * cause missed detections in a moderation classifier; letterboxing keeps every
+ * pixel at its true shape. Pad margins only appear for non-square inputs.
  *
  * Resize backend: createImageBitmap (off-thread, HW-accelerated) is used when it
  * can resize AND — for the "nearest" filter — actually honours "pixelated"
  * (decided once by probeBitmapCaps). Otherwise we scale on a 2D canvas with
  * imageSmoothingEnabled forced off, the reliable nearest path on engines that
- * ignore the hint. The scaled image is composited at (ox,oy): for "border" that
- * centres it over the pad; for "center" the offset is negative so the canvas
- * clips the overflow. For bit-exact parity vs the Python pipeline, bake
- * resize+normalize into the ONNX graph.
+ * ignore the hint. The scaled image is composited centred over the pad. For
+ * bit-exact parity vs the Python pipeline, bake resize+normalize into the ONNX
+ * graph.
  */
 async function resizeToSquare(
   px: PixelData,
@@ -277,19 +248,19 @@ async function resizeToSquare(
   const S = cfg.size;
   const dst = getScratch("dst", S, S);
   const nearest = cfg.interpolation === "nearest";
-  const mode: FitMode = cfg.resizeMode ?? (cfg.doCenterCrop ? "center" : "squash");
-  const { dw, dh, ox, oy } = computeRect(px.width, px.height, S, mode);
 
-  // Only "border" leaves uncovered pixels: paint the pad so the letterbox
-  // margins are a known constant rather than stale canvas content. The other
-  // modes fully cover S×S, so a clear is enough (transparent reads back as 0).
-  if (mode === "border") {
-    const pad: [number, number, number] = cfg.padColor ?? [0, 0, 0];
-    dst.ctx.fillStyle = `rgb(${pad[0]}, ${pad[1]}, ${pad[2]})`;
-    dst.ctx.fillRect(0, 0, S, S);
-  } else {
-    dst.ctx.clearRect(0, 0, S, S);
-  }
+  // Letterbox geometry: fit inside S x S, centre, pad the rest. Dims use round
+  // and offsets use floor — mirrored by letterbox / RandomLetterbox in the
+  // Python pipeline, so train, calibration, and serve share one geometry.
+  const scale = Math.min(S / px.width, S / px.height);
+  const dw = Math.max(1, Math.round(px.width * scale));
+  const dh = Math.max(1, Math.round(px.height * scale));
+  const ox = Math.floor((S - dw) / 2);
+  const oy = Math.floor((S - dh) / 2);
+
+  const pad: [number, number, number] = cfg.padColor ?? [0, 0, 0];
+  dst.ctx.fillStyle = `rgb(${pad[0]}, ${pad[1]}, ${pad[2]})`;
+  dst.ctx.fillRect(0, 0, S, S);
 
   const caps = await probeBitmapCaps();
   const useBitmap = caps.resize && (!nearest || caps.pixelated);

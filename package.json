@@ -1,6 +1,6 @@
 {
   "name": "@pixagram/nsfw-lite",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Fast on-device binary (sfw/nsfw) image classification for the browser — ~65 ms per image on CPU from a sub-1 MB-gzipped model. A uint8-quantized MobileNetV4-conv-small-050 runs through onnxruntime-web at 160px, tuned for pixel art, in a Web Worker with an automatic main-thread fallback. The model is base64-embedded as one self-contained bundle, so there's no runtime model fetch.",
   "type": "module",
   "license": "Apache-2.0",

@@ -17,5 +17,9 @@
   ],
   "includeTop": false,
   "interpolation": "nearest",
-  "resizeMode": "squash"
+  "padColor": [
+    0,
+    0,
+    0
+  ]
 }

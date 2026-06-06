@@ -91,6 +91,7 @@ import os
 import random
 
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -157,6 +158,77 @@ class ModelEma:
                 ev.copy_(v)
 
 
+def letterbox(img, size, resample, pad_color=(0, 0, 0)):
+    """Map an arbitrary-aspect PIL image to a `size`x`size` RGB image by
+    LETTERBOXING — preserve the aspect ratio, fit the WHOLE image inside, and pad
+    the margins with pad_color. Same geometry as export_model.py's letterbox and
+    the browser's resizeToSquare (src/core.ts), so train-val, calibration, and
+    serve agree. Dims use round-half-up and offsets use floor (JS Math.round /
+    Math.floor)."""
+    w, h = img.size
+    if w == 0 or h == 0:
+        return Image.new("RGB", (size, size), tuple(pad_color))
+    scale = min(size / w, size / h)
+    dw = max(1, int(w * scale + 0.5))
+    dh = max(1, int(h * scale + 0.5))
+    resized = img.resize((dw, dh), resample)
+    ox = (size - dw) // 2  # >=0; matches Math.floor
+    oy = (size - dh) // 2
+    canvas = Image.new("RGB", (size, size), tuple(pad_color))
+    canvas.paste(resized, (ox, oy))
+    return canvas
+
+
+class Letterbox:
+    """Deterministic letterbox transform (PIL image -> PIL image), the val/eval
+    geometry. RandomLetterbox below is its train-time, jittered counterpart."""
+
+    def __init__(self, size, interp, pad_color=(0, 0, 0)):
+        self.size = int(size)
+        self.pad_color = tuple(int(c) for c in pad_color)[:3]
+        _RES = getattr(Image, "Resampling", Image)  # Pillow >=9.1 moved the enum
+        self.resample = {"bilinear": _RES.BILINEAR,
+                         "nearest": _RES.NEAREST}.get(interp, _RES.BILINEAR)
+
+    def __call__(self, img):
+        return letterbox(img.convert("RGB"), self.size, self.resample, self.pad_color)
+
+
+class RandomLetterbox:
+    """Train-time analogue of 'border' serve: fit the WHOLE image inside
+    size x size (aspect ratio preserved), with a random shrink (area in `scale`)
+    and a random translation, padding the rest with pad_color. At area=1 and
+    centred it equals letterbox(...); the randomness puts letterbox
+    bars of VARYING size and position into the train distribution, so the model
+    meets the bars it will see at serve instead of only at inference. PIL->PIL;
+    flip / colour-jitter / erase follow in the Compose."""
+
+    def __init__(self, size, interp, pad_color=(0, 0, 0), scale=(0.8, 1.0)):
+        self.size = int(size)
+        self.pad = tuple(int(c) for c in pad_color)[:3]
+        self.lo, self.hi = float(scale[0]), float(scale[1])
+        _RES = getattr(Image, "Resampling", Image)
+        self.resample = {"bilinear": _RES.BILINEAR,
+                         "nearest": _RES.NEAREST}.get(interp, _RES.BILINEAR)
+
+    def __call__(self, img):
+        img = img.convert("RGB")
+        w, h = img.size
+        S = self.size
+        if w == 0 or h == 0:
+            return Image.new("RGB", (S, S), self.pad)
+        bs = min(S / w, S / h)                       # fit whole image inside S x S
+        f = math.sqrt(random.uniform(self.lo, self.hi))  # area -> linear scale, <=1
+        dw = max(1, min(S, int(w * bs * f + 0.5)))
+        dh = max(1, min(S, int(h * bs * f + 0.5)))
+        resized = img.resize((dw, dh), self.resample)
+        ox = random.randint(0, S - dw)               # random translation (centred at eval)
+        oy = random.randint(0, S - dh)
+        canvas = Image.new("RGB", (S, S), self.pad)
+        canvas.paste(resized, (ox, oy))
+        return canvas
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     # Data source — choose ONE of these three:
@@ -205,6 +277,13 @@ def parse_args():
                         "The choice is recorded in the checkpoint so export + serve stay in parity "
                         "automatically; only nearest/bilinear are offered because those are the "
                         "two a browser <canvas> can reproduce exactly.")
+    p.add_argument("--pad-color", type=int, nargs=3, default=[0, 0, 0], metavar=("R", "G", "B"),
+                   help="letterbox fill colour, 0-255 (default 0 0 0 = black; matches the JS "
+                        "padColor default). The model always sees letterboxed input — aspect "
+                        "ratio preserved, whole image fit inside, margins padded with this — "
+                        "because cropping drops edge content and squashing distorts wide images, "
+                        "both of which cause missed detections in moderation. Recorded in the "
+                        "checkpoint so export calibration and the browser use the same pad.")
 
     # ── Optional knowledge distillation ──────────────────────────────────
     # Train the small _050 student to imitate a bigger, more accurate teacher
@@ -243,9 +322,12 @@ def parse_args():
 
     # Augmentation / regularization knobs.
     p.add_argument("--rrc-min", type=float, default=0.8,
-                   help="RandomResizedCrop lower scale bound (default 0.8). Higher = gentler "
-                        "cropping; for NSFW, avoids cropping the explicit region out of frame "
-                        "and stays closer to the full-frame resize used at serve time.")
+                   help="lower area bound for the random letterbox shrink during training "
+                        "(default 0.8). The train aug fits the whole image inside the square "
+                        "(like serve) and randomly shrinks it within [rrc-min, 1] + translates, "
+                        "so the model sees bars of varying size/position. Higher = gentler "
+                        "(less bar-size jitter), keeping training closer to the deterministic "
+                        "eval letterbox.")
     p.add_argument("--random-erase", type=float, default=0.25,
                    help="RandomErasing probability (default 0.25; 0 disables). Occludes a small "
                         "patch — a cheap regularizer that, unlike heavy cropping, leaves the "
@@ -516,13 +598,22 @@ def main():
     else:
         print(f"[train] input size={size}  mean={mean}  std={std}")
 
-    # Resize filter, shared by train aug + val so the model only ever sees one
-    # interpolation. The same choice is saved in the checkpoint and flows to
-    # calibration + the browser, so train/serve parity holds by construction.
-    interp_mode = {"bilinear": transforms.InterpolationMode.BILINEAR,
-                   "nearest": transforms.InterpolationMode.NEAREST}[args.interp]
+    # The resize filter (args.interp) is shared by the train aug + val so the
+    # model only ever sees one interpolation; it's saved in the checkpoint and
+    # flows to calibration + the browser, so train/serve parity holds.
+    pad_color = tuple(int(c) for c in args.pad_color)[:3]
+
+    # Train spatial augmentation = RandomLetterbox: fit the WHOLE image inside the
+    # square (preserve aspect ratio), with a random shrink + translation, padded.
+    # This matches the deterministic letterbox served at eval (Letterbox below)
+    # and, crucially, puts the bars the model sees at serve into the TRAIN
+    # distribution. (We letterbox rather than RandomResizedCrop because cropping
+    # drops edge content and squashing distorts wide images — both miss detections
+    # in moderation.) flip / colour-jitter / erase follow.
+    spatial = RandomLetterbox(size, args.interp, pad_color, scale=(args.rrc_min, 1.0))
+
     train_tf_list = [
-        transforms.RandomResizedCrop(size, scale=(args.rrc_min, 1.0), interpolation=interp_mode),
+        spatial,
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(0.1, 0.1, 0.1),
         transforms.ToTensor(),
@@ -534,8 +625,12 @@ def main():
         train_tf_list.append(transforms.RandomErasing(p=args.random_erase))
     train_tf_list.append(transforms.Normalize(mean, std))
     train_tf = transforms.Compose(train_tf_list)
+
+    # Deterministic letterbox = the val/serve geometry, identical to
+    # export_model.py's letterbox and the browser's resizeToSquare. The train aug
+    # above is its jittered counterpart, so train and serve share one geometry.
     val_tf = transforms.Compose([
-        transforms.Resize((size, size), interpolation=interp_mode),  # == the browser canvas resize
+        Letterbox(size, args.interp, pad_color),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
@@ -690,6 +785,7 @@ def main():
             "mean": mean,
             "std": std,
             "interp": args.interp,
+            "pad_color": list(pad_color),
             "macro_f1": f1,
         }, best_path)
 
@@ -702,10 +798,16 @@ def main():
         # job timeout) lands on the Hub as a COMPLETE, immediately-usable model.
         with open(os.path.join(args.out_dir, "labels.json"), "w") as f:
             json.dump(labels, f)
+        # interpolation + padColor make a mid-run-pushed checkpoint serve with
+        # the SAME filter and pad it was trained on (export_model.py re-emits
+        # identical values). The fit is always letterbox; cropSize/doCenterCrop
+        # stay inert.
         preprocess = {
             "size": size, "cropSize": None, "doCenterCrop": False,
             "rescaleFactor": 1.0 / 255.0, "rescaleOffset": False,
             "doNormalize": True, "mean": mean, "std": std, "includeTop": False,
+            "interpolation": args.interp,
+            "padColor": list(pad_color),
         }
         with open(os.path.join(args.out_dir, "preprocess.json"), "w") as f:
             json.dump(preprocess, f, indent=2)
