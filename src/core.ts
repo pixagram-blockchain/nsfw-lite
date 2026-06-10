@@ -25,7 +25,13 @@ export interface Session {
   session: ort.InferenceSession;
   inputName: string;
   outputName: string;
-  backend: string; // the execution provider that actually started, e.g. "webgpu"
+  /**
+   * The backend that actually INITIALISED: "webgpu" or "wasm". On "webgpu",
+   * individual ops without a GPU kernel (the quantize/dequantize nodes) still
+   * run on CPU per-op inside the same session — that fallback is intrinsic to
+   * ORT's graph partitioning, not something this label tracks.
+   */
+  backend: string;
 }
 
 export interface RuntimeOptions {
@@ -44,6 +50,8 @@ export function configureRuntime(opts: RuntimeOptions = {}): void {
   } catch {
     /* ignore */
   }
+  // No-op on ort-web >= ~1.19 (SIMD is always built in and the flag is
+  // ignored); kept for older runtimes where it still matters.
   try {
     ort.env.wasm.simd = true;
   } catch {
@@ -65,6 +73,28 @@ export function configureRuntime(opts: RuntimeOptions = {}): void {
   configured = true;
 }
 
+/**
+ * True only if WebGPU is genuinely usable here. `navigator.gpu` existing is NOT
+ * enough: Chromium exposes the object even when the GPU is blocklisted, hardware
+ * acceleration is off, or the platform rollout hasn't reached this machine —
+ * requestAdapter() then resolves null. Only a non-null adapter proves it works.
+ * Valid in both window and dedicated-worker scopes (workers without WebGPU
+ * support simply have no `gpu` or return a null adapter).
+ */
+async function webgpuAvailable(): Promise<boolean> {
+  try {
+    const nav = (
+      globalThis as { navigator?: { gpu?: { requestAdapter(): Promise<unknown> } } }
+    ).navigator;
+    const gpu = nav?.gpu;
+    if (!gpu) return false;
+    const adapter = await gpu.requestAdapter();
+    return adapter !== null && adapter !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 export async function loadSession(
   bytes: Uint8Array,
   opts: RuntimeOptions = {}
@@ -75,30 +105,28 @@ export async function loadSession(
   void probeBitmapCaps();
 
   const pref = opts.backend ?? "auto";
-  const hasGPU =
-    typeof navigator !== "undefined" &&
-    !!(navigator as unknown as { gpu?: unknown }).gpu;
+  const useGPU =
+    pref === "webgpu" || (pref === "auto" && (await webgpuAvailable()));
 
-  // For the GPU path, pass ["webgpu","wasm"] as ONE provider list. ORT runs each
-  // op on the WebGPU EP when it has a kernel and falls back to CPU per-op
-  // otherwise — within a single session. This is what lets an INT8/QDQ model run
-  // on WebGPU at all: listing "webgpu" alone would fail on any unsupported
-  // quantize/dequantize op and drop the whole model to CPU. Pure "wasm" is used
-  // when the GPU is unwanted or the WebGPU API isn't present.
-  const useGPU = pref === "webgpu" || (pref === "auto" && hasGPU);
-  const providers = useGPU ? ["webgpu", "wasm"] : ["wasm"];
-
+  // Request ONE backend at a time. Per-op CPU fallback for the INT8/QDQ ops is
+  // intrinsic to the session — ORT always registers the CPU EP last during
+  // graph partitioning, so ["webgpu"] alone still runs unsupported
+  // quantize/dequantize nodes on CPU within the same session. Listing "wasm"
+  // alongside it added only silent BACKEND fallback at init time: when the
+  // WebGPU backend failed to start, ORT quietly created the session on wasm
+  // and this code still labelled it "webgpu" (and the catch below never ran).
   let session: ort.InferenceSession;
-  let used = useGPU ? "webgpu" : "wasm";
+  let used: "webgpu" | "wasm" = useGPU ? "webgpu" : "wasm";
   try {
     session = await ort.InferenceSession.create(bytes, {
-      executionProviders: providers,
+      executionProviders: [used],
       graphOptimizationLevel: "all",
     });
   } catch (e) {
-    // WebGPU couldn't initialise at all (no adapter, etc.). If we weren't forced
-    // onto it, retry pure CPU; if the caller forced "webgpu", surface the error.
-    if (useGPU && pref !== "webgpu") {
+    // WebGPU backend couldn't initialise after all (device request refused,
+    // adapter lost, etc.). Auto mode retries pure CPU; an explicit "webgpu"
+    // request surfaces the error instead of hiding it.
+    if (used === "webgpu" && pref !== "webgpu") {
       session = await ort.InferenceSession.create(bytes, {
         executionProviders: ["wasm"],
         graphOptimizationLevel: "all",
@@ -114,8 +142,9 @@ export async function loadSession(
   if (!inputName || !outputName) {
     throw new Error("@pixagram/nsfw-lite: model has no input/output names");
   }
-  // `used` is the PRIMARY provider; with the GPU path some ops may still run on
-  // CPU via fallback. The measured ms is the real signal of how well it landed.
+  // `used` is the backend that actually initialised; with "webgpu" some ops may
+  // still run on CPU via per-op fallback. The measured ms is the real signal of
+  // how well it landed.
   return { session, inputName, outputName, backend: used };
 }
 
@@ -125,11 +154,11 @@ export async function loadSession(
  * Allocating an OffscreenCanvas + 2D context for every image is wasteful when
  * the whole point is to classify many images. We keep one canvas per role and
  * only resize it when the required dimensions change (resizing also clears it).
- * Sharing across calls is safe: a worker handles one message at a time, and in
- * classifyBatch the loop reads each canvas back with getImageData (which
- * copies) before the next iteration overwrites it. There is no `await` between
- * a draw and its read, so the draw+read is atomic even if classify() calls
- * overlap on the main thread.
+ * Sharing across calls is safe because resizeToSquare resolves all of its async
+ * work (capability probe, bitmap decode) BEFORE touching a scratch canvas: the
+ * fill -> draw -> read section is fully synchronous, so overlapping calls on
+ * the main thread cannot interleave inside it. (The worker is sequential by
+ * construction — one message at a time.)
  */
 interface Scratch {
   canvas: OffscreenCanvas;
@@ -240,13 +269,16 @@ function probeBitmapCaps(): Promise<BitmapCaps> {
  * ignore the hint. The scaled image is composited centred over the pad. For
  * bit-exact parity vs the Python pipeline, bake resize+normalize into the ONNX
  * graph.
+ *
+ * Ordering note: ALL awaits happen before the scratch canvases are touched, so
+ * the pad-fill -> composite -> getImageData section is atomic with respect to
+ * other in-flight resizes sharing the same scratches (see Scratch docs).
  */
 async function resizeToSquare(
   px: PixelData,
   cfg: PreprocessConfig
 ): Promise<Uint8ClampedArray> {
   const S = cfg.size;
-  const dst = getScratch("dst", S, S);
   const nearest = cfg.interpolation === "nearest";
 
   // Letterbox geometry: fit inside S x S, centre, pad the rest. Dims use round
@@ -258,25 +290,31 @@ async function resizeToSquare(
   const ox = Math.floor((S - dw) / 2);
   const oy = Math.floor((S - dh) / 2);
 
-  const pad: [number, number, number] = cfg.padColor ?? [0, 0, 0];
-  dst.ctx.fillStyle = `rgb(${pad[0]}, ${pad[1]}, ${pad[2]})`;
-  dst.ctx.fillRect(0, 0, S, S);
-
+  // Resolve everything asynchronous up front.
   const caps = await probeBitmapCaps();
   const useBitmap = caps.resize && (!nearest || caps.pixelated);
-
+  let bmp: ImageBitmap | null = null;
   if (useBitmap) {
     // Cast to any: newer TS types Uint8ClampedArray as generic over
     // ArrayBufferLike (incl. SharedArrayBuffer) and rejects it for ImageData;
     // runtime is a plain ArrayBuffer. Type-only.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const srcData = new ImageData(px.data as any, px.width, px.height);
-    const bmp = await createImageBitmap(srcData, {
+    bmp = await createImageBitmap(srcData, {
       resizeWidth: dw,
       resizeHeight: dh,
       resizeQuality: nearest ? "pixelated" : "medium",
       premultiplyAlpha: "none", // match getImageData's non-premultiplied RGBA
     });
+  }
+
+  // --- Synchronous from here: no await between pad fill and readback. ---
+  const dst = getScratch("dst", S, S);
+  const pad: [number, number, number] = cfg.padColor ?? [0, 0, 0];
+  dst.ctx.fillStyle = `rgb(${pad[0]}, ${pad[1]}, ${pad[2]})`;
+  dst.ctx.fillRect(0, 0, S, S);
+
+  if (bmp) {
     dst.ctx.imageSmoothingEnabled = false; // 1:1 composite at (ox,oy); no scaling
     dst.ctx.drawImage(bmp, ox, oy);
     bmp.close();
@@ -385,10 +423,12 @@ export function decode(
 }
 
 function simdTag(): string {
+  // ort-web >= ~1.19 always ships SIMD and ignores (or no longer exposes)
+  // env.wasm.simd — so a missing flag means SIMD is on, not off.
   try {
-    return ort.env.wasm.simd ? "+simd" : "";
+    return (ort.env.wasm as { simd?: boolean }).simd === false ? "" : "+simd";
   } catch {
-    return "";
+    return "+simd";
   }
 }
 
